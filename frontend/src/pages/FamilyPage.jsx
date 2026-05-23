@@ -82,7 +82,7 @@ export default function FamilyPage() {
                         Who's at the table
                     </h1>
                     <p className="text-ink-secondary mt-2 max-w-xl">
-                        Tell Jarvis once. It'll remember diets, allergies and
+                        Tell HomeOS once. It'll remember diets, allergies and
                         preferences for every meal it suggests.
                     </p>
                 </div>

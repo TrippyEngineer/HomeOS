@@ -1,4 +1,4 @@
-@import url("https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Figtree:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap");
+@import url("https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,500;0,9..144,600;0,9..144,700;0,9..144,800;0,9..144,900;1,9..144,400;1,9..144,500;1,9..144,600&family=Figtree:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500&display=swap");
 
 @tailwind base;
 @tailwind components;
@@ -7,10 +7,11 @@
 body {
     margin: 0;
     font-family: "Figtree", system-ui, sans-serif;
-    color: #2d312a;
-    background-color: #f9f8f6;
+    color: #1a1f1b;
+    background-color: #f5f1ea;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
+    font-feature-settings: "ss01", "cv11";
 }
 
 h1,
@@ -19,32 +20,38 @@ h3,
 h4,
 h5,
 h6 {
-    font-family: "Manrope", system-ui, sans-serif;
-    letter-spacing: -0.02em;
+    font-family: "Fraunces", ui-serif, Georgia, serif;
+    letter-spacing: -0.025em;
+    font-variation-settings: "opsz" 100, "SOFT" 50;
+}
+
+::selection {
+    background: #c0512a;
+    color: #fff;
 }
 
 @layer base {
     :root {
-        --background: 44 22% 97%;
-        --foreground: 90 6% 18%;
+        --background: 40 25% 94%;
+        --foreground: 100 6% 11%;
         --card: 0 0% 100%;
-        --card-foreground: 90 6% 18%;
+        --card-foreground: 100 6% 11%;
         --popover: 0 0% 100%;
-        --popover-foreground: 90 6% 18%;
-        --primary: 128 13% 38%;
+        --popover-foreground: 100 6% 11%;
+        --primary: 128 21% 30%;
         --primary-foreground: 0 0% 100%;
-        --secondary: 84 11% 91%;
-        --secondary-foreground: 90 6% 18%;
-        --muted: 84 11% 91%;
-        --muted-foreground: 90 4% 38%;
-        --accent: 16 63% 60%;
+        --secondary: 44 22% 86%;
+        --secondary-foreground: 100 6% 11%;
+        --muted: 44 22% 86%;
+        --muted-foreground: 95 5% 30%;
+        --accent: 18 64% 46%;
         --accent-foreground: 0 0% 100%;
-        --destructive: 0 70% 50%;
+        --destructive: 0 70% 45%;
         --destructive-foreground: 0 0% 98%;
-        --border: 40 11% 88%;
-        --input: 40 11% 88%;
-        --ring: 16 63% 60%;
-        --radius: 0.875rem;
+        --border: 38 22% 81%;
+        --input: 38 22% 81%;
+        --ring: 18 64% 46%;
+        --radius: 1rem;
     }
 }
 
@@ -59,51 +66,54 @@ h6 {
 
 @layer utilities {
     .text-ink {
-        color: #2d312a;
+        color: #1a1f1b;
     }
     .text-ink-secondary {
-        color: #5e645a;
+        color: #4a4f47;
     }
     .text-ink-muted {
-        color: #8a9085;
+        color: #7a8077;
+    }
+    .text-ink-inverse {
+        color: #ffffff;
     }
     .bg-bg-base {
-        background-color: #f9f8f6;
+        background-color: #f5f1ea;
     }
     .bg-bg-surface {
         background-color: #ffffff;
     }
     .bg-bg-muted {
-        background-color: #e8ebe4;
+        background-color: #e8e1d5;
+    }
+    .bg-bg-accent {
+        background-color: #1f2a24;
     }
     .border-stoke {
-        border-color: #e5e2dc;
+        border-color: #dcd4c2;
     }
 
     .glass-header {
-        background: rgba(249, 248, 246, 0.78);
-        backdrop-filter: saturate(180%) blur(16px);
-        -webkit-backdrop-filter: saturate(180%) blur(16px);
+        background: rgba(245, 241, 234, 0.82);
+        backdrop-filter: saturate(180%) blur(20px);
+        -webkit-backdrop-filter: saturate(180%) blur(20px);
     }
 
     .card-hover {
-        transition: all 0.22s cubic-bezier(0.4, 0, 0.2, 1);
+        transition: all 0.28s cubic-bezier(0.16, 1, 0.3, 1);
     }
     .card-hover:hover {
-        transform: translateY(-2px);
+        transform: translateY(-3px);
         box-shadow:
-            0 10px 24px -16px rgba(45, 49, 42, 0.18),
-            0 2px 6px -2px rgba(45, 49, 42, 0.08);
-        border-color: #d3cdc2;
+            0 14px 32px -18px rgba(26, 31, 27, 0.28),
+            0 3px 8px -2px rgba(26, 31, 27, 0.08);
+        border-color: #c8bda3;
     }
 
     .grain-bg {
         background-image:
-            radial-gradient(
-                rgba(45, 49, 42, 0.04) 1px,
-                transparent 1px
-            ),
-            radial-gradient(rgba(45, 49, 42, 0.03) 1px, transparent 1px);
+            radial-gradient(rgba(31, 42, 36, 0.045) 1px, transparent 1px),
+            radial-gradient(rgba(192, 81, 42, 0.04) 1px, transparent 1px);
         background-size:
             18px 18px,
             32px 32px;
@@ -111,4 +121,67 @@ h6 {
             0 0,
             9px 9px;
     }
+
+    /* Bold "stamp" headline treatment */
+    .display-stamp {
+        font-family: "Fraunces", serif;
+        font-weight: 800;
+        font-variation-settings: "opsz" 144, "SOFT" 30;
+        letter-spacing: -0.045em;
+        line-height: 0.95;
+    }
+
+    .display-italic {
+        font-family: "Fraunces", serif;
+        font-style: italic;
+        font-weight: 500;
+        font-variation-settings: "opsz" 144;
+    }
+
+    /* Overline label used throughout */
+    .overline {
+        font-family: "Figtree", sans-serif;
+        font-size: 11px;
+        letter-spacing: 0.22em;
+        text-transform: uppercase;
+        font-weight: 700;
+    }
+
+    /* Striking primary CTA — deep forest with terracotta double-border */
+    .btn-cta {
+        position: relative;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        background-color: #1f2a24;
+        color: #ffffff !important;
+        font-weight: 600;
+        border-radius: 9999px;
+        transition: all 0.2s ease;
+    }
+    .btn-cta:hover {
+        background-color: #0f1a14;
+        transform: translateY(-1px);
+        box-shadow: 0 10px 24px -10px rgba(31, 42, 36, 0.55);
+    }
+    .btn-cta:active {
+        transform: translateY(0);
+    }
+
+    .btn-accent {
+        background-color: #c0512a;
+        color: #ffffff !important;
+        font-weight: 600;
+        border-radius: 9999px;
+        transition: all 0.2s ease;
+    }
+    .btn-accent:hover {
+        background-color: #a04220;
+        transform: translateY(-1px);
+        box-shadow: 0 10px 24px -10px rgba(192, 81, 42, 0.55);
+    }
+}
+
+[data-debug-wrapper="true"] {
+    display: contents !important;
 }

@@ -175,7 +175,7 @@ export default function Dashboard() {
                             <Button className="w-full justify-start rounded-xl bg-white text-ink border border-stoke hover:bg-bg-muted h-auto py-4">
                                 <MessageCircle className="h-4 w-4 mr-3 text-sage" />
                                 <span className="text-left">
-                                    <span className="block font-medium">Ask Jarvis</span>
+                                    <span className="block font-medium">Ask HomeOS</span>
                                     <span className="block text-xs text-ink-muted">"What's for dinner?"</span>
                                 </span>
                             </Button>

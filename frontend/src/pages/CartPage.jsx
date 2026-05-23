@@ -113,7 +113,7 @@ export default function CartPage() {
                         {cart?.items?.length || 0} {cart?.items?.length === 1 ? "item" : "items"} ready
                     </h1>
                     <p className="text-ink-secondary mt-2 max-w-xl">
-                        Items here came from your group chat or were added manually. Review, edit, and order — Jarvis will never order without your tap.
+                        Items here came from your group chat or were added manually. Review, edit, and order — HomeOS will never order without your tap.
                     </p>
                 </div>
             </div>
@@ -146,7 +146,7 @@ export default function CartPage() {
                     <ShoppingCart className="h-10 w-10 text-ink-muted mx-auto mb-3" />
                     <p className="font-display text-xl text-ink">Your cart is empty</p>
                     <p className="text-ink-secondary mt-2 max-w-sm mx-auto">
-                        Start chatting in your home group — Jarvis will pick up on things like "we're out of dal" and add them here.
+                        Start chatting in your home group — HomeOS will pick up on things like "we're out of dal" and add them here.
                     </p>
                     <Link to="/app" data-testid="cart-empty-chat-link">
                         <Button className="mt-6 rounded-full bg-sage hover:bg-sage-hover text-white">

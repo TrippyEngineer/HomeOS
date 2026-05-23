@@ -199,7 +199,7 @@ export default function PantryPage() {
                         Your pantry is empty
                     </p>
                     <p className="text-ink-secondary mt-2">
-                        Add a few essentials so Jarvis can keep an eye on them.
+                        Add a few essentials so HomeOS can keep an eye on them.
                     </p>
                     <Button
                         onClick={() => setCreating(true)}

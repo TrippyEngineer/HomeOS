@@ -4,7 +4,7 @@ import { api } from "@/lib/api";
 const AuthContext = createContext(null);
 
 export const AuthProvider = ({ children }) => {
-    const [token, setToken] = useState(() => localStorage.getItem("jarvis_token"));
+    const [token, setToken] = useState(() => localStorage.getItem("homeos_token"));
     const [user, setUser] = useState(null);
     const [household, setHousehold] = useState(null);
     const [loading, setLoading] = useState(true);
@@ -20,7 +20,7 @@ export const AuthProvider = ({ children }) => {
                 setUser(data.user);
                 setHousehold(data.household);
             } catch (e) {
-                localStorage.removeItem("jarvis_token");
+                localStorage.removeItem("homeos_token");
                 setToken(null);
             } finally {
                 setLoading(false);
@@ -30,7 +30,7 @@ export const AuthProvider = ({ children }) => {
     }, [token]);
 
     const handleAuthResult = (data) => {
-        localStorage.setItem("jarvis_token", data.token);
+        localStorage.setItem("homeos_token", data.token);
         setToken(data.token);
         setUser(data.user);
         setHousehold(data.household);
@@ -57,7 +57,7 @@ export const AuthProvider = ({ children }) => {
     };
 
     const logout = () => {
-        localStorage.removeItem("jarvis_token");
+        localStorage.removeItem("homeos_token");
         setToken(null);
         setUser(null);
         setHousehold(null);

@@ -17,14 +17,18 @@ from typing import Optional, List
 import jwt
 import bcrypt
 import instaloader
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, Query
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Query, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, EmailStr
+from sse_starlette.sse import EventSourceResponse
 
 from emergentintegrations.llm.chat import LlmChat, UserMessage
+
+from broadcaster import broadcaster
+from orchestrator import orchestrator, AgentResult
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -46,11 +50,12 @@ USER_COLORS = [
     "#3F7C9B", "#B97A3C", "#7C5BA6", "#3F8F7C", "#C46B45",
 ]
 
-JARVIS_ID = "jarvis-bot"
+HOMEOS_ID = "homeos-bot"
+JARVIS_ID = HOMEOS_ID  # backwards-compat alias used in older code paths
 
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
-app = FastAPI(title="Jarvis for Home API")
+app = FastAPI(title="HomeOS API")
 api = APIRouter(prefix="/api")
 security = HTTPBearer()
 
@@ -218,7 +223,18 @@ async def _post_system_message(household_id: str, content: str):
         "created_at": now_iso(),
     }
     await db.chat_messages.insert_one(msg)
-    return strip_id(msg)
+    strip_id(msg)
+    await broadcaster.publish(household_id, {"type": "message", "message": msg})
+    return msg
+
+
+async def _broadcast_message(msg: dict):
+    """Push a fresh chat message to all SSE subscribers of its household."""
+    if not msg:
+        return
+    hid = msg.get("household_id")
+    if hid:
+        await broadcaster.publish(hid, {"type": "message", "message": msg})
 
 
 @api.post("/auth/register")
@@ -515,12 +531,12 @@ async def get_household_context(household_id: str) -> str:
     return "\n".join(lines)
 
 
-JARVIS_SYSTEM = """You are Jarvis — an AI member quietly present in an Indian household's group chat.
+JARVIS_SYSTEM = """You are HomeOS — an AI member quietly present in an Indian household's group chat.
 
 You are NOT a chatty bot. You behave like a thoughtful family member who only speaks when needed.
 
 WHEN TO REPLY (should_reply=true):
-- Message mentions "jarvis" or "@jarvis"
+- Message mentions "homeos", "home os", "@homeos", "jarvis" or "@jarvis"
 - Message is a direct question (ends with ?) asking for suggestion, recipe, recommendation
 - Message contains a recipe link (Instagram, YouTube, blog) — extract recipe + ingredients, share a quick summary
 - Multiple grocery/cooking needs accumulating and you should propose action
@@ -759,7 +775,7 @@ async def _process_instagram_link(household_id: str, user: dict, content: str) -
             "id": str(uuid.uuid4()),
             "household_id": household_id,
             "sender_id": JARVIS_ID,
-            "sender_name": "Jarvis",
+            "sender_name": "HomeOS",
             "sender_color": "#D97757",
             "role": "assistant",
             "content": (
@@ -778,7 +794,7 @@ async def _process_instagram_link(household_id: str, user: dict, content: str) -
             "id": str(uuid.uuid4()),
             "household_id": household_id,
             "sender_id": JARVIS_ID,
-            "sender_name": "Jarvis",
+            "sender_name": "HomeOS",
             "sender_color": "#D97757",
             "role": "assistant",
             "content": f"I read the Instagram caption from @{ig.get('owner', '')} but couldn't pull a clear recipe out. Send the dish name and I'll help.",
@@ -937,22 +953,26 @@ async def send_chat(payload: ChatReq, user=Depends(get_current_user)):
         "created_at": now_iso(),
     }
     await db.chat_messages.insert_one(user_msg)
+    strip_id(user_msg)
+    await _broadcast_message(user_msg)
 
-    new_msgs = [strip_id(user_msg)]
+    new_msgs = [user_msg]
 
     # Check for Instagram link first — if found, extract recipe instead of running normal Jarvis flow
     ig_messages = await _process_instagram_link(household_id, user, content)
     if ig_messages:
         new_msgs.extend(ig_messages)
+        for m in ig_messages:
+            await _broadcast_message(m)
         cart_updated = True
     else:
-        # Run Jarvis logic (chat)
+        # Run HomeOS chat agent
         decision = await _run_jarvis(household_id, user["name"], content)
 
         cart_updated = False
         if decision["extracted_items"]:
             await _add_items_to_draft(
-                household_id, decision["extracted_items"], user["name"], source="jarvis"
+                household_id, decision["extracted_items"], user["name"], source="homeos"
             )
             cart_updated = True
 
@@ -961,14 +981,16 @@ async def send_chat(payload: ChatReq, user=Depends(get_current_user)):
                 "id": str(uuid.uuid4()),
                 "household_id": household_id,
                 "sender_id": JARVIS_ID,
-                "sender_name": "Jarvis",
+                "sender_name": "HomeOS",
                 "sender_color": "#D97757",
                 "role": "assistant",
                 "content": decision["reply"],
                 "created_at": now_iso(),
             }
             await db.chat_messages.insert_one(bot_msg)
-            new_msgs.append(strip_id(bot_msg))
+            strip_id(bot_msg)
+            new_msgs.append(bot_msg)
+            await _broadcast_message(bot_msg)
 
     # Auto cart proposal: if draft cart has >=4 items and no recent cart proposal
     if cart_updated:
@@ -990,7 +1012,7 @@ async def send_chat(payload: ChatReq, user=Depends(get_current_user)):
                     "id": str(uuid.uuid4()),
                     "household_id": household_id,
                     "sender_id": JARVIS_ID,
-                    "sender_name": "Jarvis",
+                    "sender_name": "HomeOS",
                     "sender_color": "#D97757",
                     "role": "cart_proposal",
                     "content": f"I've put together a list of {len(cart['items'])} items from your chat. Want to review and order?",
@@ -999,9 +1021,43 @@ async def send_chat(payload: ChatReq, user=Depends(get_current_user)):
                     "created_at": now_iso(),
                 }
                 await db.chat_messages.insert_one(proposal)
-                new_msgs.append(strip_id(proposal))
+                strip_id(proposal)
+                new_msgs.append(proposal)
+                await _broadcast_message(proposal)
 
     return {"messages": new_msgs}
+
+
+# -------- SSE stream (real-time push) --------
+@api.get("/chat/stream")
+async def chat_stream(request: Request, token: str = Query(...)):
+    """Server-Sent Events: streams new chat messages to the household.
+    EventSource cannot send headers, so JWT comes via ?token=... query param."""
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+        household_id = payload["household_id"]
+    except jwt.PyJWTError:
+        raise HTTPException(401, "Invalid token")
+
+    q = await broadcaster.subscribe(household_id)
+
+    async def event_gen():
+        try:
+            # initial hello so clients know the stream is live
+            yield {"event": "ready", "data": json.dumps({"household_id": household_id})}
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    payload = await asyncio.wait_for(q.get(), timeout=20.0)
+                    yield {"event": "message", "data": payload}
+                except asyncio.TimeoutError:
+                    # heartbeat keeps proxies from closing the connection
+                    yield {"event": "ping", "data": "1"}
+        finally:
+            await broadcaster.unsubscribe(household_id, q)
+
+    return EventSourceResponse(event_gen())
 
 
 # -------- Cart --------
@@ -1160,9 +1216,11 @@ async def checkout_swiggy(cart_id: str, user=Depends(get_current_user)):
         "created_at": now_iso(),
     }
     await db.chat_messages.insert_one(confirm_msg)
+    strip_id(confirm_msg)
+    await _broadcast_message(confirm_msg)
 
     final = await db.carts.find_one({"id": cart_id}, {"_id": 0})
-    return {"cart": final, "message": strip_id(confirm_msg)}
+    return {"cart": final, "message": confirm_msg}
 
 
 # -------- Recipe extraction from URL (mock for POC) --------
@@ -1313,7 +1371,7 @@ Sections: Breakfast/Lunch/Dinner. Each: ingredients (4 ppl quantities), 4-6 prep
 # -------- Health --------
 @api.get("/")
 async def root():
-    return {"app": "Jarvis for Home", "status": "ok"}
+    return {"app": "HomeOS", "status": "ok"}
 
 
 app.include_router(api)

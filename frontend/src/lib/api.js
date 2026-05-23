@@ -6,7 +6,7 @@ export const API = `${BACKEND_URL}/api`;
 export const api = axios.create({ baseURL: API });
 
 api.interceptors.request.use((config) => {
-    const token = localStorage.getItem("jarvis_token");
+    const token = localStorage.getItem("homeos_token");
     if (token) config.headers.Authorization = `Bearer ${token}`;
     return config;
 });
@@ -15,7 +15,7 @@ api.interceptors.response.use(
     (r) => r,
     (err) => {
         if (err?.response?.status === 401) {
-            localStorage.removeItem("jarvis_token");
+            localStorage.removeItem("homeos_token");
             if (!window.location.pathname.startsWith("/login")) {
                 window.location.href = "/login";
             }
