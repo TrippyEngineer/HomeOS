@@ -1,88 +1,1061 @@
-from fastapi import FastAPI, APIRouter
+"""
+Jarvis for Home - Backend
+WhatsApp-style group chat for households + AI agent + Swiggy (mock) checkout.
+"""
+import os
+import re
+import json
+import uuid
+import secrets
+import random
+import logging
+from pathlib import Path
+from datetime import datetime, timezone, timedelta, date
+from typing import Optional, List
+
+import jwt
+import bcrypt
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Query
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
-import os
-import logging
-from pathlib import Path
-from pydantic import BaseModel, Field, ConfigDict
-from typing import List
-import uuid
-from datetime import datetime, timezone
+from pydantic import BaseModel, Field, EmailStr
 
+from emergentintegrations.llm.chat import LlmChat, UserMessage
 
 ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env')
+load_dotenv(ROOT_DIR / ".env")
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
-# Create the main app without a prefix
-app = FastAPI()
+MONGO_URL = os.environ["MONGO_URL"]
+DB_NAME = os.environ["DB_NAME"]
+JWT_SECRET = os.environ.get("JWT_SECRET", "jarvis-home-secret")
+JWT_ALG = "HS256"
+JWT_EXP_HOURS = 24 * 7
+EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY")
+LLM_MODEL = ("anthropic", "claude-sonnet-4-5-20250929")
 
-# Create a router with the /api prefix
-api_router = APIRouter(prefix="/api")
+# Stable colors assigned to users in a household for chat bubbles (WhatsApp-style)
+USER_COLORS = [
+    "#D97757", "#546E58", "#9B6A3F", "#6A8A6F", "#A45D7D",
+    "#3F7C9B", "#B97A3C", "#7C5BA6", "#3F8F7C", "#C46B45",
+]
+
+JARVIS_ID = "jarvis-bot"
+
+client = AsyncIOMotorClient(MONGO_URL)
+db = client[DB_NAME]
+app = FastAPI(title="Jarvis for Home API")
+api = APIRouter(prefix="/api")
+security = HTTPBearer()
 
 
-# Define Models
-class StatusCheck(BaseModel):
-    model_config = ConfigDict(extra="ignore")  # Ignore MongoDB's _id field
-    
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def gen_invite_code():
+    return secrets.token_hex(4).upper()
+
+
+def strip_id(d):
+    if d:
+        d.pop("_id", None)
+    return d
+
+
+# -------- Models --------
+class RegisterReq(BaseModel):
+    name: str
+    email: EmailStr
+    password: str
+    household_name: Optional[str] = "My Home"
+
+
+class JoinReq(BaseModel):
+    name: str
+    email: EmailStr
+    password: str
+    invite_code: str
+
+
+class LoginReq(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class FamilyMember(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    client_name: str
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    name: str
+    role: str = "member"
+    diet: str = "vegetarian"
+    allergies: List[str] = []
+    preferences: str = ""
 
-class StatusCheckCreate(BaseModel):
-    client_name: str
 
-# Add your routes to the router instead of directly to app
-@api_router.get("/")
+class FamilyMemberCreate(BaseModel):
+    name: str
+    role: str = "member"
+    diet: str = "vegetarian"
+    allergies: List[str] = []
+    preferences: str = ""
+
+
+class PantryItem(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    name: str
+    qty: float = 1
+    unit: str = "kg"
+    category: str = "staple"
+    low_threshold: float = 0.5
+    updated_at: str = Field(default_factory=now_iso)
+
+
+class PantryItemCreate(BaseModel):
+    name: str
+    qty: float = 1
+    unit: str = "kg"
+    category: str = "staple"
+    low_threshold: float = 0.5
+
+
+class PantryItemUpdate(BaseModel):
+    name: Optional[str] = None
+    qty: Optional[float] = None
+    unit: Optional[str] = None
+    category: Optional[str] = None
+    low_threshold: Optional[float] = None
+
+
+class Meal(BaseModel):
+    name: str = ""
+    recipe: str = ""
+    ingredients: List[str] = []
+    notes: str = ""
+
+
+class MealUpdate(BaseModel):
+    day: str
+    slot: str
+    meal: Meal
+
+
+class ChatReq(BaseModel):
+    content: str
+
+
+class CartItem(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    name: str
+    qty: str = "1 unit"
+    note: str = ""
+    source: str = "manual"  # chat | jarvis | manual
+    added_by: str = ""  # user name
+
+
+class CartItemUpdate(BaseModel):
+    name: Optional[str] = None
+    qty: Optional[str] = None
+    note: Optional[str] = None
+
+
+# -------- Auth --------
+def hash_password(pw):
+    return bcrypt.hashpw(pw.encode(), bcrypt.gensalt()).decode()
+
+
+def verify_password(pw, hashed):
+    try:
+        return bcrypt.checkpw(pw.encode(), hashed.encode())
+    except Exception:
+        return False
+
+
+def create_token(user_id, household_id):
+    payload = {
+        "user_id": user_id,
+        "household_id": household_id,
+        "exp": datetime.now(timezone.utc) + timedelta(hours=JWT_EXP_HOURS),
+        "iat": datetime.now(timezone.utc),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
+
+
+async def get_current_user(creds: HTTPAuthorizationCredentials = Depends(security)):
+    try:
+        payload = jwt.decode(creds.credentials, JWT_SECRET, algorithms=[JWT_ALG])
+        user = await db.users.find_one({"id": payload["user_id"]}, {"_id": 0})
+        if not user:
+            raise HTTPException(401, "User not found")
+        return user
+    except jwt.PyJWTError:
+        raise HTTPException(401, "Invalid token")
+
+
+async def get_user_color(household_id: str) -> str:
+    existing = await db.users.find({"household_id": household_id}, {"_id": 0, "color": 1}).to_list(50)
+    used = {u.get("color") for u in existing if u.get("color")}
+    for c in USER_COLORS:
+        if c not in used:
+            return c
+    return random.choice(USER_COLORS)
+
+
+async def _post_system_message(household_id: str, content: str):
+    msg = {
+        "id": str(uuid.uuid4()),
+        "household_id": household_id,
+        "sender_id": "system",
+        "sender_name": "System",
+        "sender_color": "#8A9085",
+        "role": "system",
+        "content": content,
+        "created_at": now_iso(),
+    }
+    await db.chat_messages.insert_one(msg)
+    return strip_id(msg)
+
+
+@api.post("/auth/register")
+async def register(req: RegisterReq):
+    if await db.users.find_one({"email": req.email.lower()}):
+        raise HTTPException(400, "Email already registered")
+    household_id = str(uuid.uuid4())
+    user_id = str(uuid.uuid4())
+    user_doc = {
+        "id": user_id,
+        "name": req.name,
+        "email": req.email.lower(),
+        "password_hash": hash_password(req.password),
+        "household_id": household_id,
+        "color": USER_COLORS[0],
+        "created_at": now_iso(),
+    }
+    household_doc = {
+        "id": household_id,
+        "name": req.household_name or "My Home",
+        "invite_code": gen_invite_code(),
+        "owner_id": user_id,
+        "created_at": now_iso(),
+    }
+    await db.users.insert_one(user_doc)
+    await db.households.insert_one(household_doc)
+    await db.family_members.insert_one({
+        "id": str(uuid.uuid4()),
+        "household_id": household_id,
+        "name": req.name,
+        "role": "self",
+        "diet": "vegetarian",
+        "allergies": [],
+        "preferences": "",
+    })
+    await _post_system_message(household_id, f"{req.name} created the home")
+    token = create_token(user_id, household_id)
+    return {
+        "token": token,
+        "user": {"id": user_id, "name": req.name, "email": user_doc["email"], "household_id": household_id, "color": user_doc["color"]},
+        "household": strip_id(household_doc),
+    }
+
+
+@api.post("/auth/join")
+async def join(req: JoinReq):
+    if await db.users.find_one({"email": req.email.lower()}):
+        raise HTTPException(400, "Email already registered")
+    household = await db.households.find_one({"invite_code": req.invite_code.upper()}, {"_id": 0})
+    if not household:
+        raise HTTPException(404, "Invalid invite code")
+    user_id = str(uuid.uuid4())
+    color = await get_user_color(household["id"])
+    user_doc = {
+        "id": user_id,
+        "name": req.name,
+        "email": req.email.lower(),
+        "password_hash": hash_password(req.password),
+        "household_id": household["id"],
+        "color": color,
+        "created_at": now_iso(),
+    }
+    await db.users.insert_one(user_doc)
+    await db.family_members.insert_one({
+        "id": str(uuid.uuid4()),
+        "household_id": household["id"],
+        "name": req.name,
+        "role": "member",
+        "diet": "vegetarian",
+        "allergies": [],
+        "preferences": "",
+    })
+    await _post_system_message(household["id"], f"{req.name} joined the home")
+    token = create_token(user_id, household["id"])
+    return {
+        "token": token,
+        "user": {"id": user_id, "name": req.name, "email": user_doc["email"], "household_id": household["id"], "color": color},
+        "household": household,
+    }
+
+
+@api.post("/auth/login")
+async def login(req: LoginReq):
+    user = await db.users.find_one({"email": req.email.lower()}, {"_id": 0})
+    if not user or not verify_password(req.password, user["password_hash"]):
+        raise HTTPException(401, "Invalid credentials")
+    household = await db.households.find_one({"id": user["household_id"]}, {"_id": 0})
+    token = create_token(user["id"], user["household_id"])
+    return {
+        "token": token,
+        "user": {"id": user["id"], "name": user["name"], "email": user["email"], "household_id": user["household_id"], "color": user.get("color", USER_COLORS[0])},
+        "household": household,
+    }
+
+
+@api.get("/auth/me")
+async def me(user=Depends(get_current_user)):
+    household = await db.households.find_one({"id": user["household_id"]}, {"_id": 0})
+    return {
+        "user": {"id": user["id"], "name": user["name"], "email": user["email"], "household_id": user["household_id"], "color": user.get("color", USER_COLORS[0])},
+        "household": household,
+    }
+
+
+# -------- Household --------
+@api.get("/household")
+async def get_household(user=Depends(get_current_user)):
+    household = await db.households.find_one({"id": user["household_id"]}, {"_id": 0})
+    members = await db.users.find(
+        {"household_id": user["household_id"]},
+        {"_id": 0, "password_hash": 0, "email": 0},
+    ).to_list(50)
+    return {"household": household, "members": members}
+
+
+@api.post("/household/rotate-invite")
+async def rotate_invite(user=Depends(get_current_user)):
+    household = await db.households.find_one({"id": user["household_id"]}, {"_id": 0})
+    if not household:
+        raise HTTPException(404, "Household missing")
+    new_code = gen_invite_code()
+    await db.households.update_one({"id": user["household_id"]}, {"$set": {"invite_code": new_code}})
+    household["invite_code"] = new_code
+    return household
+
+
+# -------- Family --------
+@api.get("/family")
+async def list_family(user=Depends(get_current_user)):
+    return await db.family_members.find({"household_id": user["household_id"]}, {"_id": 0}).to_list(100)
+
+
+@api.post("/family")
+async def add_family(payload: FamilyMemberCreate, user=Depends(get_current_user)):
+    m = FamilyMember(**payload.model_dump()).model_dump()
+    m["household_id"] = user["household_id"]
+    await db.family_members.insert_one(m)
+    return strip_id(m)
+
+
+@api.put("/family/{mid}")
+async def update_family(mid: str, payload: FamilyMemberCreate, user=Depends(get_current_user)):
+    await db.family_members.update_one(
+        {"id": mid, "household_id": user["household_id"]}, {"$set": payload.model_dump()}
+    )
+    return await db.family_members.find_one({"id": mid}, {"_id": 0})
+
+
+@api.delete("/family/{mid}")
+async def delete_family(mid: str, user=Depends(get_current_user)):
+    await db.family_members.delete_one({"id": mid, "household_id": user["household_id"]})
+    return {"ok": True}
+
+
+# -------- Pantry --------
+@api.get("/pantry")
+async def list_pantry(user=Depends(get_current_user)):
+    items = await db.pantry.find({"household_id": user["household_id"]}, {"_id": 0}).to_list(500)
+    items.sort(key=lambda x: x.get("name", ""))
+    return items
+
+
+@api.post("/pantry")
+async def add_pantry(payload: PantryItemCreate, user=Depends(get_current_user)):
+    item = PantryItem(**payload.model_dump()).model_dump()
+    item["household_id"] = user["household_id"]
+    await db.pantry.insert_one(item)
+    return strip_id(item)
+
+
+@api.put("/pantry/{iid}")
+async def update_pantry(iid: str, payload: PantryItemUpdate, user=Depends(get_current_user)):
+    update = {k: v for k, v in payload.model_dump().items() if v is not None}
+    update["updated_at"] = now_iso()
+    await db.pantry.update_one({"id": iid, "household_id": user["household_id"]}, {"$set": update})
+    return await db.pantry.find_one({"id": iid}, {"_id": 0})
+
+
+@api.delete("/pantry/{iid}")
+async def delete_pantry(iid: str, user=Depends(get_current_user)):
+    await db.pantry.delete_one({"id": iid, "household_id": user["household_id"]})
+    return {"ok": True}
+
+
+@api.get("/pantry/low")
+async def low_pantry(user=Depends(get_current_user)):
+    items = await db.pantry.find({"household_id": user["household_id"]}, {"_id": 0}).to_list(500)
+    return [i for i in items if float(i.get("qty", 0)) <= float(i.get("low_threshold", 0))]
+
+
+# -------- Meal plan --------
+def week_dates(start: Optional[date] = None):
+    today = start or date.today()
+    monday = today - timedelta(days=today.weekday())
+    return [(monday + timedelta(days=i)).isoformat() for i in range(7)]
+
+
+@api.get("/mealplan/week")
+async def get_week(user=Depends(get_current_user)):
+    days = week_dates()
+    plans = await db.meal_plans.find(
+        {"household_id": user["household_id"], "date": {"$in": days}}, {"_id": 0}
+    ).to_list(7)
+    by_date = {p["date"]: p for p in plans}
+    out = []
+    for d in days:
+        out.append(by_date.get(d) or {
+            "id": str(uuid.uuid4()),
+            "household_id": user["household_id"],
+            "date": d,
+            "breakfast": Meal().model_dump(),
+            "lunch": Meal().model_dump(),
+            "dinner": Meal().model_dump(),
+        })
+    return out
+
+
+@api.put("/mealplan/meal")
+async def update_meal(payload: MealUpdate, user=Depends(get_current_user)):
+    if payload.slot not in ("breakfast", "lunch", "dinner"):
+        raise HTTPException(400, "Invalid slot")
+    existing = await db.meal_plans.find_one(
+        {"household_id": user["household_id"], "date": payload.day}, {"_id": 0}
+    )
+    if existing:
+        await db.meal_plans.update_one(
+            {"household_id": user["household_id"], "date": payload.day},
+            {"$set": {payload.slot: payload.meal.model_dump()}},
+        )
+    else:
+        doc = {
+            "id": str(uuid.uuid4()),
+            "household_id": user["household_id"],
+            "date": payload.day,
+            "breakfast": Meal().model_dump(),
+            "lunch": Meal().model_dump(),
+            "dinner": Meal().model_dump(),
+        }
+        doc[payload.slot] = payload.meal.model_dump()
+        await db.meal_plans.insert_one(doc)
+    return await db.meal_plans.find_one(
+        {"household_id": user["household_id"], "date": payload.day}, {"_id": 0}
+    )
+
+
+@api.get("/mealplan/today")
+async def today_plan(user=Depends(get_current_user)):
+    today = date.today().isoformat()
+    plan = await db.meal_plans.find_one(
+        {"household_id": user["household_id"], "date": today}, {"_id": 0}
+    )
+    if not plan:
+        return {
+            "id": str(uuid.uuid4()),
+            "household_id": user["household_id"],
+            "date": today,
+            "breakfast": Meal().model_dump(),
+            "lunch": Meal().model_dump(),
+            "dinner": Meal().model_dump(),
+        }
+    return plan
+
+
+# -------- AI Context --------
+async def get_chat_context(household_id: str, limit: int = 12):
+    msgs = await db.chat_messages.find(
+        {"household_id": household_id}, {"_id": 0}
+    ).sort("created_at", -1).limit(limit).to_list(limit)
+    msgs.reverse()
+    return msgs
+
+
+async def get_household_context(household_id: str) -> str:
+    members = await db.family_members.find({"household_id": household_id}, {"_id": 0}).to_list(100)
+    pantry = await db.pantry.find({"household_id": household_id}, {"_id": 0}).to_list(500)
+    users = await db.users.find({"household_id": household_id}, {"_id": 0, "name": 1}).to_list(50)
+    today = date.today().isoformat()
+    today_plan = await db.meal_plans.find_one(
+        {"household_id": household_id, "date": today}, {"_id": 0}
+    )
+    low = [p for p in pantry if float(p.get("qty", 0)) <= float(p.get("low_threshold", 0))]
+
+    lines = [
+        f"ACTIVE CHAT USERS: {', '.join([u['name'] for u in users])}",
+        f"FAMILY ({len(members)}):",
+    ]
+    for m in members:
+        allergies = ", ".join(m.get("allergies", [])) or "none"
+        lines.append(f"  - {m['name']} ({m['role']}, {m['diet']}, allergies: {allergies}, prefs: {m.get('preferences', '')})")
+    lines.append(f"PANTRY LOW ({len(low)}): " + (", ".join([f"{p['name']} ({p['qty']} {p['unit']})" for p in low]) or "none"))
+    lines.append("PANTRY TOP STOCK: " + ", ".join([p["name"] for p in pantry[:15]]))
+    if today_plan:
+        lines.append(f"TODAY'S PLAN: B: {today_plan.get('breakfast', {}).get('name', '-')} | L: {today_plan.get('lunch', {}).get('name', '-')} | D: {today_plan.get('dinner', {}).get('name', '-')}")
+    return "\n".join(lines)
+
+
+JARVIS_SYSTEM = """You are Jarvis — an AI member quietly present in an Indian household's group chat.
+
+You are NOT a chatty bot. You behave like a thoughtful family member who only speaks when needed.
+
+WHEN TO REPLY (should_reply=true):
+- Message mentions "jarvis" or "@jarvis"
+- Message is a direct question (ends with ?) asking for suggestion, recipe, recommendation
+- Message contains a recipe link (Instagram, YouTube, blog) — extract recipe + ingredients, share a quick summary
+- Multiple grocery/cooking needs accumulating and you should propose action
+
+WHEN TO STAY SILENT (should_reply=false):
+- Family members chatting casually with each other
+- Greetings, status updates, jokes
+- Coordination between members that doesn't need you
+
+ALWAYS extract grocery intents from EVERY message (silently):
+- "out of X" / "X khatam" / "X finishing" / "need to buy X" / "running low on X" / "kal X laana hai"
+- Recipe ingredients when a recipe is shared
+- Add to `extracted_items`. Use Indian units (kg, g, l, ml, packet, pcs).
+
+REPLY STYLE:
+- Short (1-3 sentences). Conversational, warm. Use Hindi/Indian English where natural ("achha", "thoda", "dal", "sabzi").
+- Address the person by name when relevant.
+- Suggest, don't decide. Never auto-order.
+- Avoid emojis.
+
+OUTPUT: strictly valid JSON only, no markdown:
+{
+  "should_reply": true|false,
+  "reply": "string (empty if not replying)",
+  "extracted_items": [{"name":"toor dal","qty":"1 kg","note":"optional context"}]
+}
+"""
+
+
+async def _run_jarvis(household_id: str, sender_name: str, message_text: str) -> dict:
+    if not EMERGENT_LLM_KEY:
+        return {"should_reply": False, "reply": "", "extracted_items": []}
+
+    ctx = await get_household_context(household_id)
+    recent = await get_chat_context(household_id, 10)
+    recent_str = "\n".join([
+        f"{m.get('sender_name', '?')}: {m.get('content', '')}"
+        for m in recent if m.get("role") in ("user", "assistant", "system")
+    ])
+
+    prompt = f"""HOUSEHOLD CONTEXT:
+{ctx}
+
+RECENT CHAT (oldest first):
+{recent_str}
+
+LATEST MESSAGE from {sender_name}:
+\"\"\"{message_text}\"\"\"
+
+Decide what to do. Respond with JSON only.
+"""
+    try:
+        llm = LlmChat(
+            api_key=EMERGENT_LLM_KEY,
+            session_id=f"jarvis-{household_id}-{uuid.uuid4()}",
+            system_message=JARVIS_SYSTEM,
+        ).with_model(LLM_MODEL[0], LLM_MODEL[1])
+        raw = await llm.send_message(UserMessage(text=prompt))
+        text = raw if isinstance(raw, str) else str(raw)
+        text = text.strip()
+        if text.startswith("```"):
+            text = text.split("```", 2)[1]
+            if text.startswith("json"):
+                text = text[4:]
+            text = text.strip("` \n")
+        data = json.loads(text)
+        return {
+            "should_reply": bool(data.get("should_reply", False)),
+            "reply": str(data.get("reply", "")).strip(),
+            "extracted_items": data.get("extracted_items", []) or [],
+        }
+    except Exception as e:
+        logger.error(f"Jarvis LLM error: {e}")
+        return {"should_reply": False, "reply": "", "extracted_items": []}
+
+
+async def _get_or_create_draft_cart(household_id: str):
+    cart = await db.carts.find_one(
+        {"household_id": household_id, "status": "draft"}, {"_id": 0}
+    )
+    if cart:
+        return cart
+    cart = {
+        "id": str(uuid.uuid4()),
+        "household_id": household_id,
+        "status": "draft",
+        "items": [],
+        "swiggy_order_id": None,
+        "estimated_total": 0,
+        "eta_minutes": None,
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+    await db.carts.insert_one(cart)
+    return strip_id(cart)
+
+
+async def _add_items_to_draft(household_id: str, items: list, added_by: str, source: str):
+    if not items:
+        return None
+    cart = await _get_or_create_draft_cart(household_id)
+    existing_names = {it["name"].lower(): it for it in cart["items"]}
+    added = []
+    for it in items:
+        name = (it.get("name") or "").strip()
+        if not name:
+            continue
+        if name.lower() in existing_names:
+            continue
+        new_item = {
+            "id": str(uuid.uuid4()),
+            "name": name,
+            "qty": it.get("qty") or "1 unit",
+            "note": it.get("note", ""),
+            "source": source,
+            "added_by": added_by,
+        }
+        cart["items"].append(new_item)
+        existing_names[name.lower()] = new_item
+        added.append(new_item)
+    if added:
+        cart["updated_at"] = now_iso()
+        await db.carts.update_one(
+            {"id": cart["id"]},
+            {"$set": {"items": cart["items"], "updated_at": cart["updated_at"]}},
+        )
+    return cart
+
+
+# -------- Chat (group) --------
+@api.get("/chat/history")
+async def chat_history(limit: int = 200, user=Depends(get_current_user)):
+    msgs = await db.chat_messages.find(
+        {"household_id": user["household_id"]}, {"_id": 0}
+    ).sort("created_at", -1).limit(limit).to_list(limit)
+    msgs.reverse()
+    return msgs
+
+
+@api.get("/chat/since")
+async def chat_since(after: str = Query(""), user=Depends(get_current_user)):
+    q = {"household_id": user["household_id"]}
+    if after:
+        q["created_at"] = {"$gt": after}
+    msgs = await db.chat_messages.find(q, {"_id": 0}).sort("created_at", 1).to_list(200)
+    return msgs
+
+
+@api.delete("/chat/history")
+async def clear_history(user=Depends(get_current_user)):
+    await db.chat_messages.delete_many({"household_id": user["household_id"]})
+    return {"ok": True}
+
+
+@api.post("/chat")
+async def send_chat(payload: ChatReq, user=Depends(get_current_user)):
+    household_id = user["household_id"]
+    content = payload.content.strip()
+    if not content:
+        raise HTTPException(400, "Empty message")
+
+    user_msg = {
+        "id": str(uuid.uuid4()),
+        "household_id": household_id,
+        "sender_id": user["id"],
+        "sender_name": user["name"],
+        "sender_color": user.get("color", USER_COLORS[0]),
+        "role": "user",
+        "content": content,
+        "created_at": now_iso(),
+    }
+    await db.chat_messages.insert_one(user_msg)
+
+    new_msgs = [strip_id(user_msg)]
+
+    # Run Jarvis logic
+    decision = await _run_jarvis(household_id, user["name"], content)
+
+    # Add extracted items to draft cart silently
+    cart_updated = False
+    if decision["extracted_items"]:
+        await _add_items_to_draft(
+            household_id, decision["extracted_items"], user["name"], source="jarvis"
+        )
+        cart_updated = True
+
+    # Save Jarvis reply if any
+    if decision["should_reply"] and decision["reply"]:
+        bot_msg = {
+            "id": str(uuid.uuid4()),
+            "household_id": household_id,
+            "sender_id": JARVIS_ID,
+            "sender_name": "Jarvis",
+            "sender_color": "#D97757",
+            "role": "assistant",
+            "content": decision["reply"],
+            "created_at": now_iso(),
+        }
+        await db.chat_messages.insert_one(bot_msg)
+        new_msgs.append(strip_id(bot_msg))
+
+    # Auto cart proposal: if draft cart has >=4 items and no recent cart proposal
+    if cart_updated:
+        cart = await db.carts.find_one(
+            {"household_id": household_id, "status": "draft"}, {"_id": 0}
+        )
+        if cart and len(cart.get("items", [])) >= 4:
+            recent_proposals = await db.chat_messages.find(
+                {"household_id": household_id, "role": "cart_proposal"}, {"_id": 0}
+            ).sort("created_at", -1).limit(1).to_list(1)
+            should_propose = True
+            if recent_proposals:
+                last = recent_proposals[0]
+                # only re-propose if items count grew since last proposal
+                if last.get("cart_items_count", 0) >= len(cart["items"]):
+                    should_propose = False
+            if should_propose:
+                proposal = {
+                    "id": str(uuid.uuid4()),
+                    "household_id": household_id,
+                    "sender_id": JARVIS_ID,
+                    "sender_name": "Jarvis",
+                    "sender_color": "#D97757",
+                    "role": "cart_proposal",
+                    "content": f"I've put together a list of {len(cart['items'])} items from your chat. Want to review and order?",
+                    "cart_id": cart["id"],
+                    "cart_items_count": len(cart["items"]),
+                    "created_at": now_iso(),
+                }
+                await db.chat_messages.insert_one(proposal)
+                new_msgs.append(strip_id(proposal))
+
+    return {"messages": new_msgs}
+
+
+# -------- Cart --------
+@api.get("/cart")
+async def get_cart(user=Depends(get_current_user)):
+    cart = await db.carts.find_one(
+        {"household_id": user["household_id"], "status": "draft"}, {"_id": 0}
+    )
+    if not cart:
+        cart = await _get_or_create_draft_cart(user["household_id"])
+    return cart
+
+
+@api.get("/cart/all")
+async def list_carts(user=Depends(get_current_user)):
+    return await db.carts.find(
+        {"household_id": user["household_id"]}, {"_id": 0}
+    ).sort("created_at", -1).limit(20).to_list(20)
+
+
+@api.post("/cart/item")
+async def add_cart_item(payload: CartItem, user=Depends(get_current_user)):
+    cart = await _get_or_create_draft_cart(user["household_id"])
+    item = payload.model_dump()
+    item["added_by"] = user["name"]
+    item["source"] = "manual"
+    cart["items"].append(item)
+    cart["updated_at"] = now_iso()
+    await db.carts.update_one(
+        {"id": cart["id"]}, {"$set": {"items": cart["items"], "updated_at": cart["updated_at"]}}
+    )
+    return cart
+
+
+@api.put("/cart/item/{item_id}")
+async def update_cart_item(item_id: str, payload: CartItemUpdate, user=Depends(get_current_user)):
+    cart = await _get_or_create_draft_cart(user["household_id"])
+    updates = {k: v for k, v in payload.model_dump().items() if v is not None}
+    for it in cart["items"]:
+        if it["id"] == item_id:
+            it.update(updates)
+            break
+    cart["updated_at"] = now_iso()
+    await db.carts.update_one(
+        {"id": cart["id"]}, {"$set": {"items": cart["items"], "updated_at": cart["updated_at"]}}
+    )
+    return cart
+
+
+@api.delete("/cart/item/{item_id}")
+async def delete_cart_item(item_id: str, user=Depends(get_current_user)):
+    cart = await _get_or_create_draft_cart(user["household_id"])
+    cart["items"] = [it for it in cart["items"] if it["id"] != item_id]
+    cart["updated_at"] = now_iso()
+    await db.carts.update_one(
+        {"id": cart["id"]}, {"$set": {"items": cart["items"], "updated_at": cart["updated_at"]}}
+    )
+    return cart
+
+
+@api.delete("/cart/clear")
+async def clear_cart(user=Depends(get_current_user)):
+    cart = await _get_or_create_draft_cart(user["household_id"])
+    await db.carts.update_one({"id": cart["id"]}, {"$set": {"items": [], "updated_at": now_iso()}})
+    return await db.carts.find_one({"id": cart["id"]}, {"_id": 0})
+
+
+# -------- Swiggy Mock (clearly mocked) --------
+# NOTE: This is a MOCK Swiggy MCP integration for POC purposes only.
+# Real Swiggy MCP / Instamart MCP integration would replace this layer.
+SWIGGY_PRICE_LOOKUP = {
+    "atta": 320, "rice": 180, "toor dal": 220, "moong dal": 200, "chana dal": 180,
+    "oil": 180, "ghee": 650, "salt": 30, "sugar": 60, "tea": 280, "milk": 65,
+    "curd": 45, "paneer": 95, "onion": 35, "potato": 30, "tomato": 50,
+    "ginger": 90, "garlic": 120, "green chilli": 80, "coriander": 40, "lemon": 50,
+}
+
+
+def _mock_swiggy_price(name: str) -> int:
+    n = name.lower()
+    for k, v in SWIGGY_PRICE_LOOKUP.items():
+        if k in n or n in k:
+            return v
+    return random.choice([60, 80, 120, 150, 200, 250])
+
+
+@api.post("/cart/{cart_id}/checkout")
+async def checkout_swiggy(cart_id: str, user=Depends(get_current_user)):
+    """MOCK Swiggy Instamart checkout. Replace with real MCP integration when available."""
+    cart = await db.carts.find_one(
+        {"id": cart_id, "household_id": user["household_id"]}, {"_id": 0}
+    )
+    if not cart:
+        raise HTTPException(404, "Cart not found")
+    if cart.get("status") != "draft":
+        raise HTTPException(400, "Cart already processed")
+    if not cart.get("items"):
+        raise HTTPException(400, "Cart is empty")
+
+    # Mock pricing
+    line_items = []
+    subtotal = 0
+    for it in cart["items"]:
+        price = _mock_swiggy_price(it["name"])
+        subtotal += price
+        line_items.append({**it, "price": price})
+
+    delivery_fee = 29 if subtotal < 500 else 0
+    total = subtotal + delivery_fee
+    order_id = f"SWGY-{secrets.token_hex(4).upper()}"
+    eta = random.randint(15, 35)
+
+    update = {
+        "status": "ordered",
+        "items": line_items,
+        "swiggy_order_id": order_id,
+        "estimated_total": total,
+        "subtotal": subtotal,
+        "delivery_fee": delivery_fee,
+        "eta_minutes": eta,
+        "ordered_at": now_iso(),
+        "ordered_by": user["name"],
+        "mocked": True,
+        "updated_at": now_iso(),
+    }
+    await db.carts.update_one({"id": cart_id}, {"$set": update})
+
+    # System message announcing the order
+    confirm_msg = {
+        "id": str(uuid.uuid4()),
+        "household_id": user["household_id"],
+        "sender_id": JARVIS_ID,
+        "sender_name": "Jarvis",
+        "sender_color": "#D97757",
+        "role": "system",
+        "content": f"{user['name']} placed a Swiggy Instamart order ({len(line_items)} items, ₹{total}). ETA {eta} mins. Order ID {order_id}. [MOCKED]",
+        "created_at": now_iso(),
+    }
+    await db.chat_messages.insert_one(confirm_msg)
+
+    final = await db.carts.find_one({"id": cart_id}, {"_id": 0})
+    return {"cart": final, "message": strip_id(confirm_msg)}
+
+
+# -------- Recipe extraction from URL (mock for POC) --------
+@api.post("/cart/from-chat")
+async def build_cart_from_chat(user=Depends(get_current_user)):
+    """Force Jarvis to scan recent chat and propose a cart."""
+    if not EMERGENT_LLM_KEY:
+        raise HTTPException(500, "LLM not configured")
+    msgs = await get_chat_context(user["household_id"], 30)
+    chat_str = "\n".join([
+        f"{m.get('sender_name','?')}: {m.get('content','')}"
+        for m in msgs if m.get("role") == "user"
+    ])
+    if not chat_str:
+        raise HTTPException(400, "No chat to analyze yet")
+
+    prompt = f"""You are extracting grocery items from a family group chat.
+
+Chat:
+{chat_str}
+
+Return JSON only:
+{{"extracted_items":[{{"name":"...","qty":"1 kg","note":"..."}}]}}
+"""
+    try:
+        llm = LlmChat(
+            api_key=EMERGENT_LLM_KEY,
+            session_id=f"cart-{user['household_id']}-{uuid.uuid4()}",
+            system_message="You extract Indian household grocery items from chat. JSON only.",
+        ).with_model(LLM_MODEL[0], LLM_MODEL[1])
+        raw = await llm.send_message(UserMessage(text=prompt))
+        text = raw if isinstance(raw, str) else str(raw)
+        text = text.strip()
+        if text.startswith("```"):
+            text = text.split("```", 2)[1]
+            if text.startswith("json"):
+                text = text[4:]
+            text = text.strip("` \n")
+        data = json.loads(text)
+        items = data.get("extracted_items", [])
+    except Exception as e:
+        raise HTTPException(500, f"LLM error: {e}")
+
+    await _add_items_to_draft(user["household_id"], items, user["name"], source="chat")
+    return await db.carts.find_one(
+        {"household_id": user["household_id"], "status": "draft"}, {"_id": 0}
+    )
+
+
+# -------- AI bulk endpoints (unchanged) --------
+@api.post("/ai/generate-weekly-plan")
+async def generate_weekly_plan(user=Depends(get_current_user)):
+    if not EMERGENT_LLM_KEY:
+        raise HTTPException(500, "LLM key not configured")
+    household_id = user["household_id"]
+    days = week_dates()
+    ctx = await get_household_context(household_id)
+    prompt = f"""{ctx}
+
+Create a 7-day Indian household meal plan for: {', '.join(days)}.
+Respect diets and allergies. Simple home-style meals.
+
+Return ONLY valid JSON:
+{{"days":[{{"date":"YYYY-MM-DD","breakfast":{{"name":"...","ingredients":["..."],"notes":"..."}},"lunch":{{"name":"...","ingredients":["..."],"notes":"..."}},"dinner":{{"name":"...","ingredients":["..."],"notes":"..."}}}}]}}
+"""
+    llm = LlmChat(
+        api_key=EMERGENT_LLM_KEY,
+        session_id=f"plan-{household_id}-{uuid.uuid4()}",
+        system_message="You output strict JSON meal plans.",
+    ).with_model(LLM_MODEL[0], LLM_MODEL[1])
+    try:
+        raw = await llm.send_message(UserMessage(text=prompt))
+        text = raw if isinstance(raw, str) else str(raw)
+        text = text.strip()
+        if text.startswith("```"):
+            text = text.split("```", 2)[1]
+            if text.startswith("json"):
+                text = text[4:]
+            text = text.strip("` \n")
+        data = json.loads(text)
+    except Exception as e:
+        raise HTTPException(500, f"Failed to generate: {e}")
+
+    for d in data.get("days", []):
+        date_str = d.get("date")
+        if not date_str:
+            continue
+        doc = {
+            "id": str(uuid.uuid4()),
+            "household_id": household_id,
+            "date": date_str,
+            "breakfast": {"name": d.get("breakfast", {}).get("name", ""), "recipe": "", "ingredients": d.get("breakfast", {}).get("ingredients", []), "notes": d.get("breakfast", {}).get("notes", "")},
+            "lunch": {"name": d.get("lunch", {}).get("name", ""), "recipe": "", "ingredients": d.get("lunch", {}).get("ingredients", []), "notes": d.get("lunch", {}).get("notes", "")},
+            "dinner": {"name": d.get("dinner", {}).get("name", ""), "recipe": "", "ingredients": d.get("dinner", {}).get("ingredients", []), "notes": d.get("dinner", {}).get("notes", "")},
+        }
+        await db.meal_plans.update_one(
+            {"household_id": household_id, "date": date_str}, {"$set": doc}, upsert=True
+        )
+    plans = await db.meal_plans.find(
+        {"household_id": household_id, "date": {"$in": days}}, {"_id": 0}
+    ).to_list(7)
+    plans.sort(key=lambda p: p["date"])
+    return plans
+
+
+@api.post("/ai/cook-instructions")
+async def cook_instructions(user=Depends(get_current_user)):
+    if not EMERGENT_LLM_KEY:
+        raise HTTPException(500, "LLM not configured")
+    household_id = user["household_id"]
+    today = date.today().isoformat()
+    plan = await db.meal_plans.find_one(
+        {"household_id": household_id, "date": today}, {"_id": 0}
+    )
+    if not plan:
+        raise HTTPException(404, "No meal plan for today")
+    members = await db.family_members.find({"household_id": household_id}, {"_id": 0}).to_list(100)
+    pantry = await db.pantry.find({"household_id": household_id}, {"_id": 0}).to_list(200)
+    meals_str = "\n".join([
+        f"Breakfast: {plan.get('breakfast', {}).get('name', '(none)')}",
+        f"Lunch: {plan.get('lunch', {}).get('name', '(none)')}",
+        f"Dinner: {plan.get('dinner', {}).get('name', '(none)')}",
+    ])
+    prompt = f"""Write friendly cook handover instructions in warm tone, WhatsApp-ready.
+
+Family:
+{chr(10).join([f"- {m['name']} ({m['diet']}, allergies: {', '.join(m.get('allergies', [])) or 'none'})" for m in members])}
+
+Today:
+{meals_str}
+
+Pantry: {', '.join([p['name'] for p in pantry[:20]])}
+
+Sections: Breakfast/Lunch/Dinner. Each: ingredients (4 ppl quantities), 4-6 prep steps, notes. End with items to buy.
+"""
+    llm = LlmChat(
+        api_key=EMERGENT_LLM_KEY,
+        session_id=f"cook-{household_id}-{uuid.uuid4()}",
+        system_message="Practical Indian household cook notes. Plain text only.",
+    ).with_model(LLM_MODEL[0], LLM_MODEL[1])
+    try:
+        raw = await llm.send_message(UserMessage(text=prompt))
+        return {"date": today, "instructions": raw if isinstance(raw, str) else str(raw), "plan": plan}
+    except Exception as e:
+        raise HTTPException(500, f"LLM error: {e}")
+
+
+# -------- Health --------
+@api.get("/")
 async def root():
-    return {"message": "Hello World"}
+    return {"app": "Jarvis for Home", "status": "ok"}
 
-@api_router.post("/status", response_model=StatusCheck)
-async def create_status_check(input: StatusCheckCreate):
-    status_dict = input.model_dump()
-    status_obj = StatusCheck(**status_dict)
-    
-    # Convert to dict and serialize datetime to ISO string for MongoDB
-    doc = status_obj.model_dump()
-    doc['timestamp'] = doc['timestamp'].isoformat()
-    
-    _ = await db.status_checks.insert_one(doc)
-    return status_obj
 
-@api_router.get("/status", response_model=List[StatusCheck])
-async def get_status_checks():
-    # Exclude MongoDB's _id field from the query results
-    status_checks = await db.status_checks.find({}, {"_id": 0}).to_list(1000)
-    
-    # Convert ISO string timestamps back to datetime objects
-    for check in status_checks:
-        if isinstance(check['timestamp'], str):
-            check['timestamp'] = datetime.fromisoformat(check['timestamp'])
-    
-    return status_checks
-
-# Include the router in the main app
-app.include_router(api_router)
-
+app.include_router(api)
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
 
 @app.on_event("shutdown")
 async def shutdown_db_client():

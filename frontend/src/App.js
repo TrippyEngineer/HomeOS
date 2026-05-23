@@ -1,54 +1,58 @@
-import { useEffect } from "react";
+import React from "react";
 import "@/App.css";
-import { BrowserRouter, Routes, Route } from "react-router-dom";
-import axios from "axios";
+import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+import { Toaster } from "@/components/ui/sonner";
+import { AuthProvider, useAuth } from "@/context/AuthContext";
+import Landing from "@/pages/Landing";
+import Login from "@/pages/Login";
+import Register from "@/pages/Register";
+import Dashboard from "@/pages/Dashboard";
+import MealPlanPage from "@/pages/MealPlanPage";
+import PantryPage from "@/pages/PantryPage";
+import CookPage from "@/pages/CookPage";
+import FamilyPage from "@/pages/FamilyPage";
+import ChatPage from "@/pages/ChatPage";
+import CartPage from "@/pages/CartPage";
+import AppLayout from "@/components/AppLayout";
 
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
-const API = `${BACKEND_URL}/api`;
+const Protected = ({ children }) => {
+    const { token, loading } = useAuth();
+    if (loading) return null;
+    if (!token) return <Navigate to="/login" replace />;
+    return children;
+};
 
-const Home = () => {
-  const helloWorldApi = async () => {
-    try {
-      const response = await axios.get(`${API}/`);
-      console.log(response.data.message);
-    } catch (e) {
-      console.error(e, `errored out requesting / api`);
-    }
-  };
-
-  useEffect(() => {
-    helloWorldApi();
-  }, []);
-
-  return (
-    <div>
-      <header className="App-header">
-        <a
-          className="App-link"
-          href="https://emergent.sh"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <img src="https://avatars.githubusercontent.com/in/1201222?s=120&u=2686cf91179bbafbc7a71bfbc43004cf9ae1acea&v=4" />
-        </a>
-        <p className="mt-5">Building something incredible ~!</p>
-      </header>
-    </div>
-  );
+const PublicOnly = ({ children }) => {
+    const { token } = useAuth();
+    if (token) return <Navigate to="/app" replace />;
+    return children;
 };
 
 function App() {
-  return (
-    <div className="App">
-      <BrowserRouter>
-        <Routes>
-          <Route path="/" element={<Home />}>
-            <Route index element={<Home />} />
-          </Route>
-        </Routes>
-      </BrowserRouter>
-    </div>
-  );
+    return (
+        <div className="App">
+            <AuthProvider>
+                <BrowserRouter>
+                    <Routes>
+                        <Route path="/" element={<Landing />} />
+                        <Route path="/login" element={<PublicOnly><Login /></PublicOnly>} />
+                        <Route path="/register" element={<PublicOnly><Register /></PublicOnly>} />
+                        <Route path="/app" element={<Protected><AppLayout /></Protected>}>
+                            <Route index element={<ChatPage />} />
+                            <Route path="cart" element={<CartPage />} />
+                            <Route path="overview" element={<Dashboard />} />
+                            <Route path="meals" element={<MealPlanPage />} />
+                            <Route path="pantry" element={<PantryPage />} />
+                            <Route path="cook" element={<CookPage />} />
+                            <Route path="family" element={<FamilyPage />} />
+                        </Route>
+                        <Route path="*" element={<Navigate to="/" replace />} />
+                    </Routes>
+                </BrowserRouter>
+                <Toaster position="top-right" richColors />
+            </AuthProvider>
+        </div>
+    );
 }
 
 export default App;
