@@ -495,6 +495,7 @@ function MessageBubble({ msg, currentUserId, onRecipeClick }) {
     const isJarvis = msg.role === "assistant";
     const isCartProposal = msg.role === "cart_proposal";
     const isRecipe = msg.role === "recipe";
+    const isIgFallback = msg.role === "ig_fallback";
 
     if (isSystem) {
         return (
@@ -504,6 +505,10 @@ function MessageBubble({ msg, currentUserId, onRecipeClick }) {
                 </span>
             </div>
         );
+    }
+
+    if (isIgFallback) {
+        return <IgFallbackBubble msg={msg} />;
     }
 
     if (isRecipe) {
@@ -609,6 +614,91 @@ function MessageBubble({ msg, currentUserId, onRecipeClick }) {
                 </div>
                 <p className="whitespace-pre-wrap text-ink text-[15px] leading-relaxed break-words">{msg.content}</p>
                 <div className="text-right">
+                    <span className="text-[10px] text-ink-muted">{formatTime(msg.created_at)}</span>
+                </div>
+            </div>
+        </div>
+    );
+}
+
+function IgFallbackBubble({ msg }) {
+    const [text, setText] = useState("");
+    const [submitting, setSubmitting] = useState(false);
+    const [done, setDone] = useState(false);
+
+    const submit = async () => {
+        const t = text.trim();
+        if (t.length < 30) {
+            toast.error("Paste a bit more — ingredients + steps work best");
+            return;
+        }
+        setSubmitting(true);
+        try {
+            await api.post("/recipes/from-text", { text: t });
+            setDone(true);
+            setText("");
+            toast.success("Recipe extracted");
+        } catch (err) {
+            toast.error(err?.response?.data?.detail || "Could not extract recipe");
+        } finally {
+            setSubmitting(false);
+        }
+    };
+
+    return (
+        <div className="flex justify-start mb-2" data-testid="ig-fallback-message">
+            <div className="max-w-[92%] sm:max-w-[82%] rounded-2xl rounded-bl-md bg-terracotta-soft border-2 border-terracotta/30 shadow-sm overflow-hidden">
+                <div className="px-4 pt-3 pb-2 flex items-center gap-2">
+                    <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-terracotta text-white">
+                        <Sparkles className="h-3 w-3" />
+                    </span>
+                    <p className="font-semibold text-sm text-terracotta">HomeOS</p>
+                    <span className="overline text-ink-muted ml-auto">paste fallback</span>
+                </div>
+                <div className="px-4 pb-3">
+                    <p className="text-ink text-[15px] leading-relaxed">{msg.content}</p>
+                </div>
+                {done ? (
+                    <div className="bg-sage-soft border-t border-sage/30 px-4 py-3 text-sm font-semibold text-sage-deep flex items-center gap-2" data-testid="ig-fallback-done">
+                        <Check className="h-4 w-4" />
+                        Got it — recipe is in your cart.
+                    </div>
+                ) : (
+                    <div className="bg-white border-t border-terracotta/20 p-3 space-y-2">
+                        <Textarea
+                            value={text}
+                            onChange={(e) => setText(e.target.value)}
+                            placeholder={"Paste the full recipe here\n\nIngredients:\n- 250g paneer\n- 2 tomatoes\n...\n\nSteps:\n1. ..."}
+                            rows={5}
+                            className="rounded-xl border-2 border-stoke bg-bg-base focus-visible:ring-2 focus-visible:ring-terracotta focus-visible:border-terracotta text-ink text-[14px] resize-y"
+                            data-testid="ig-fallback-textarea"
+                        />
+                        <div className="flex items-center justify-between gap-2">
+                            <p className="text-[11px] text-ink-muted">
+                                {text.length} chars · ingredients + steps work best
+                            </p>
+                            <button
+                                onClick={submit}
+                                disabled={submitting || text.trim().length < 30}
+                                className="btn-cta px-4 py-2 text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+                                data-testid="ig-fallback-submit"
+                            >
+                                {submitting ? (
+                                    <>
+                                        <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />
+                                        Extracting…
+                                    </>
+                                ) : (
+                                    <>
+                                        <Sparkles className="h-3.5 w-3.5 mr-1.5" />
+                                        Extract recipe
+                                    </>
+                                )}
+                            </button>
+                        </div>
+                    </div>
+                )}
+                <div className="px-4 pb-2 text-right">
                     <span className="text-[10px] text-ink-muted">{formatTime(msg.created_at)}</span>
                 </div>
             </div>

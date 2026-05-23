@@ -770,22 +770,24 @@ async def _process_instagram_link(household_id: str, user: dict, content: str) -
     ig = await _fetch_ig_post(shortcode)
 
     if not ig or not ig.get("caption"):
-        # Couldn't read it — post a friendly note
+        # Couldn't read it — post a friendly note with paste-fallback affordance
         err = {
             "id": str(uuid.uuid4()),
             "household_id": household_id,
             "sender_id": JARVIS_ID,
             "sender_name": "HomeOS",
             "sender_color": "#D97757",
-            "role": "assistant",
+            "role": "ig_fallback",
             "content": (
                 "I saw the Instagram link but couldn't fetch the caption — the post might be private, "
-                "deleted, or Instagram is rate-limiting anonymous reads. If you paste the recipe text, I'll pull ingredients."
+                "deleted, or Instagram is rate-limiting from here. Paste the recipe text and I'll pull ingredients."
             ),
             "created_at": now_iso(),
         }
         await db.chat_messages.insert_one(err)
-        return [strip_id(err)]
+        strip_id(err)
+        await _broadcast_message(err)
+        return [err]
 
     recipe = await _extract_recipe_from_caption(ig["caption"])
 
@@ -796,12 +798,14 @@ async def _process_instagram_link(household_id: str, user: dict, content: str) -
             "sender_id": JARVIS_ID,
             "sender_name": "HomeOS",
             "sender_color": "#D97757",
-            "role": "assistant",
-            "content": f"I read the Instagram caption from @{ig.get('owner', '')} but couldn't pull a clear recipe out. Send the dish name and I'll help.",
+            "role": "ig_fallback",
+            "content": f"I read the Instagram caption from @{ig.get('owner', '')} but couldn't pull a clear recipe out. Paste the recipe text below and I'll extract it.",
             "created_at": now_iso(),
         }
         await db.chat_messages.insert_one(err)
-        return [strip_id(err)]
+        strip_id(err)
+        await _broadcast_message(err)
+        return [err]
 
     # Save recipe doc
     recipe_doc = {
@@ -1094,6 +1098,77 @@ async def get_recipe(recipe_id: str, user=Depends(get_current_user)):
     if not r:
         raise HTTPException(404, "Recipe not found")
     return r
+
+
+class TextRecipeReq(BaseModel):
+    text: str
+
+
+@api.post("/recipes/from-text")
+async def recipe_from_text(payload: TextRecipeReq, user=Depends(get_current_user)):
+    """Paste-text fallback: extract a recipe from arbitrary user-pasted text using
+    the same LLM pipeline as the Instagram path. Adds ingredients to the draft
+    cart and posts a recipe card to chat (broadcast over SSE)."""
+    if not EMERGENT_LLM_KEY:
+        raise HTTPException(500, "LLM not configured")
+    text = (payload.text or "").strip()
+    if len(text) < 30:
+        raise HTTPException(400, "Recipe text too short — paste the ingredients and steps")
+
+    recipe = await _extract_recipe_from_caption(text)
+    if not recipe:
+        raise HTTPException(422, "Couldn't pull a clear recipe from that text. Make sure ingredients are listed.")
+
+    household_id = user["household_id"]
+
+    recipe_doc = {
+        "id": str(uuid.uuid4()),
+        "household_id": household_id,
+        "title": recipe.get("title", "Pasted recipe"),
+        "cuisine": recipe.get("cuisine", ""),
+        "servings": recipe.get("servings", ""),
+        "summary": recipe.get("summary", ""),
+        "ingredients": recipe.get("ingredients", []),
+        "steps": recipe.get("steps", []),
+        "source_url": None,
+        "source_owner": None,
+        "thumbnail": None,
+        "video_url": None,
+        "shared_by": user["name"],
+        "shared_by_id": user["id"],
+        "created_at": now_iso(),
+    }
+    await db.recipes.insert_one(recipe_doc)
+    strip_id(recipe_doc)
+
+    items = [
+        {"name": i["name"], "qty": i.get("qty", "1"), "note": f"for {recipe_doc['title']}"}
+        for i in recipe_doc["ingredients"]
+    ]
+    if items:
+        await _add_items_to_draft(household_id, items, user["name"], source="pasted")
+
+    card = {
+        "id": str(uuid.uuid4()),
+        "household_id": household_id,
+        "sender_id": JARVIS_ID,
+        "sender_name": "HomeOS",
+        "sender_color": "#D97757",
+        "role": "recipe",
+        "content": f"Pulled the recipe for {recipe_doc['title']} from text {user['name']} pasted. {len(items)} ingredients added to the cart.",
+        "recipe_id": recipe_doc["id"],
+        "recipe_title": recipe_doc["title"],
+        "recipe_thumbnail": None,
+        "recipe_summary": recipe_doc.get("summary", ""),
+        "ingredients_count": len(items),
+        "source_owner": None,
+        "created_at": now_iso(),
+    }
+    await db.chat_messages.insert_one(card)
+    strip_id(card)
+    await _broadcast_message(card)
+    return {"recipe": recipe_doc, "message": card}
+
 
 
 
