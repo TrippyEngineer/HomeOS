@@ -1,0 +1,113 @@
+{
+  "theme": "light",
+  "archetype": "1 (Organic & Earthy)",
+  "emotional_tone": "Calm, supportive, grounded, and organized. Reducing cognitive load through warm aesthetics.",
+  "colors": {
+    "background": {
+      "base": "#F9F8F6",
+      "surface": "#FFFFFF",
+      "muted": "#E8EBE4",
+      "overlay": "rgba(0, 0, 0, 0.4)"
+    },
+    "text": {
+      "primary": "#2D312A",
+      "secondary": "#5E645A",
+      "inverse": "#FFFFFF",
+      "muted": "#8A9085"
+    },
+    "border": {
+      "default": "#E5E2DC",
+      "focus": "#D97757",
+      "subtle": "rgba(45, 49, 42, 0.08)"
+    },
+    "accent": {
+      "primary": "#546E58",
+      "primary_hover": "#455C48",
+      "secondary": "#D97757",
+      "secondary_hover": "#C06547",
+      "warning": "#E39744",
+      "success": "#6A8A6F"
+    }
+  },
+  "typography": {
+    "fonts": {
+      "heading": "Manrope, sans-serif",
+      "body": "Figtree, sans-serif",
+      "mono": "JetBrains Mono, monospace"
+    },
+    "scales": {
+      "h1": "text-4xl sm:text-5xl lg:text-6xl tracking-tight leading-none",
+      "h2": "text-2xl sm:text-3xl lg:text-4xl tracking-tight",
+      "h3": "text-xl sm:text-2xl tracking-tight",
+      "h4": "text-lg sm:text-xl font-medium",
+      "body": "text-base leading-relaxed",
+      "small": "text-sm leading-normal",
+      "overline": "text-xs tracking-[0.2em] uppercase font-bold text-[#5E645A]"
+    }
+  },
+  "layout_and_spacing": {
+    "spacing_scale": "p-2, p-4, p-6, p-8, p-12, p-16, p-24, p-32",
+    "dashboard_grid": "grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-6",
+    "marketing_grid": "grid-cols-1 md:grid-cols-8 lg:grid-cols-12 gap-8 lg:gap-12",
+    "container_padding": "p-6 or p-8 inside cards to avoid text collision with borders",
+    "alignment": "Left-align dense text and forms. Dashboard widgets must use h-full to stretch and match neighbors. Mobile-first grid-cols-1."
+  },
+  "surfaces_and_components": {
+    "header": "Crystal Glass variant: backdrop-blur-xl bg-white/70 border-b border-white/40 shadow-sm z-50",
+    "dashboard_cards": "Flat background (#FFFFFF), rounded-2xl, 1px subtle border (#E5E2DC), no shadow. On hover: -translate-y-1, shadow-lg, border-stone-300.",
+    "buttons": "Rounded-full or rounded-xl for organic feel. Primary uses #546E58 with white text. High contrast hover states. Always explicitly set hover:text-white.",
+    "inputs_and_forms": "Shadcn components heavily customized: rounded-xl borders, #F9F8F6 backgrounds, focus:ring-2 focus:ring-[#D97757]. Never use native HTML inputs.",
+    "chat_interface": "Distinct right sidebar or elevated modal. Chat bubbles: User (Warm Sand #F9F8F6), Agent (Soft Sage #E8EBE4). Input field fixed at bottom.",
+    "cook_instructions_card": "Highlight visually with a subtle Terracotta border (#D97757/30) and a light warm background to distinguish from general data."
+  },
+  "motion_and_interactions": {
+    "transitions": "transition-all duration-200 ease-in-out",
+    "hover_states": "Buttons and links must explicitly define text color on hover. Cards lift slightly (-translate-y-1).",
+    "loading": "Organic pulse or subtle blur-in. Avoid harsh spinners.",
+    "accessibility": "Focus rings must have high contrast (focus:ring-2 focus:ring-[#D97757]). Respect prefers-reduced-motion."
+  },
+  "icons_and_assets": {
+    "library": "lucide-react (default) or @phosphor-icons/react (Duotone weight for high-end look). Provide instructions to yarn add @phosphor-icons/react if used."
+  },
+  "media": {
+    "images": [
+      {
+        "category": "hero_background",
+        "url": "https://images.unsplash.com/photo-1649083048597-d7b4f1e8a386?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA3MDR8MHwxfHNlYXJjaHwzfHxtb2Rlcm4lMjB3YXJtJTIwa2l0Y2hlbiUyMGFlc3RoZXRpY3xlbnwwfHx8fDE3Nzk1NjY5OTJ8MA&ixlib=rb-4.1.0&q=85",
+        "description": "Large modern warm kitchen, perfect for a subtle hero background with an overlay.",
+        "usage": "Use with bg-black/30 or bg-white/40 overlay to ensure text contrast."
+      },
+      {
+        "category": "pantry_feature",
+        "url": "https://images.unsplash.com/photo-1592178036182-5400889dfc74?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjY2NzZ8MHwxfHNlYXJjaHwzfHxuZWF0JTIwcGFudHJ5JTIwc2hlbHZlcyUyMGdyb2Nlcmllc3xlbnwwfHx8fDE3Nzk1NjY5OTJ8MA&ixlib=rb-4.1.0&q=85",
+        "description": "Neatly arranged glass jars in a pantry.",
+        "usage": "Use in the pantry tracker feature highlight or dashboard empty state."
+      },
+      {
+        "category": "family_lifestyle",
+        "url": "https://images.unsplash.com/photo-1578496780896-7081cc23c111?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzNTl8MHwxfHNlYXJjaHwxfHxpbmRpYW4lMjBmYW1pbHklMjBjb29raW5nJTIwZGlubmVyfGVufDB8fHx8MTc3OTU2Njk5Mnww&ixlib=rb-4.1.0&q=85",
+        "description": "Family eating indoors, representing the end goal of the product.",
+        "usage": "Use in the 'About' section, family profile setup, or marketing narrative."
+      }
+    ],
+    "image_constraints": "Mobile height limit: max-h-[80vh]. Never use placeholders."
+  },
+  "testing_attributes": {
+    "rule": "All interactive and key informational elements MUST include a data-testid attribute in kebab-case, role-based.",
+    "examples": [
+      "data-testid='chat-submit-button'",
+      "data-testid='add-meal-button'",
+      "data-testid='pantry-reorder-alert'"
+    ]
+  },
+  "instructions_to_main_agent": [
+    "Read this file fully before implementation.",
+    "Set up Tailwind config with these specific color hexes and font families.",
+    "Install 'lucide-react' for icons and 'framer-motion' for subtle lifts and layout transitions.",
+    "Implement Shadcn components but override their default styles to match the 'Organic & Earthy' surfaces defined above. Remove the default Vercel-look.",
+    "The meal plan dashboard should utilize the 'Control Room' grid (dense but cleanly separated via borders, no heavy shadows).",
+    "Use the exact image URLs provided for the landing page or dashboard placeholders. Do NOT use dummyimage.com or via.placeholder.com.",
+    "Ensure all buttons, inputs, and links have 'data-testid' applied.",
+    "Do NOT use 'Inter' font anywhere for headings."
+  ]
+}
