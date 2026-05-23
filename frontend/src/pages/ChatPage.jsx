@@ -12,6 +12,7 @@ import { toast } from "sonner";
 import {
     Send, Loader2, Sparkles, Users, Copy, RefreshCw,
     ShoppingCart, Smile, Paperclip, Check, CheckCheck,
+    UtensilsCrossed, ExternalLink, X,
 } from "lucide-react";
 
 const POLL_MS = 3500;
@@ -43,6 +44,7 @@ export default function ChatPage() {
     const [householdData, setHouseholdData] = useState(household);
     const [membersOpen, setMembersOpen] = useState(false);
     const [draftCart, setDraftCart] = useState(null);
+    const [activeRecipeId, setActiveRecipeId] = useState(null);
     const scrollRef = useRef(null);
     const lastTsRef = useRef("");
 
@@ -76,7 +78,7 @@ export default function ChatPage() {
                     setMessages((m) => [...m, ...data]);
                     lastTsRef.current = data[data.length - 1].created_at;
                     // Refresh cart on cart proposals
-                    if (data.some((d) => d.role === "cart_proposal" || d.role === "system")) {
+                    if (data.some((d) => d.role === "cart_proposal" || d.role === "system" || d.role === "recipe")) {
                         const c = await api.get("/cart");
                         setDraftCart(c.data);
                     }
@@ -117,7 +119,7 @@ export default function ChatPage() {
             const lastMsg = data.messages[data.messages.length - 1];
             if (lastMsg) lastTsRef.current = lastMsg.created_at;
             // Refresh cart if any cart proposal came back
-            if (data.messages.some((m) => m.role === "cart_proposal")) {
+            if (data.messages.some((m) => m.role === "cart_proposal" || m.role === "recipe")) {
                 const c = await api.get("/cart");
                 setDraftCart(c.data);
             }
@@ -238,7 +240,7 @@ export default function ChatPage() {
                                     </div>
                                 );
                             }
-                            return <MessageBubble key={g.msg.id} msg={g.msg} currentUserId={user.id} />;
+                            return <MessageBubble key={g.msg.id} msg={g.msg} currentUserId={user.id} onRecipeClick={setActiveRecipeId} />;
                         })
                     )}
                     {sending && (
@@ -352,15 +354,134 @@ export default function ChatPage() {
                     </div>
                 </DialogContent>
             </Dialog>
+
+            {/* Recipe detail dialog */}
+            <RecipeDialog recipeId={activeRecipeId} onClose={() => setActiveRecipeId(null)} />
         </div>
     );
 }
 
-function MessageBubble({ msg, currentUserId }) {
+function RecipeDialog({ recipeId, onClose }) {
+    const [recipe, setRecipe] = useState(null);
+    const [loading, setLoading] = useState(false);
+
+    useEffect(() => {
+        if (!recipeId) {
+            setRecipe(null);
+            return;
+        }
+        setLoading(true);
+        api.get(`/recipes/${recipeId}`)
+            .then(({ data }) => setRecipe(data))
+            .catch(() => toast.error("Could not load recipe"))
+            .finally(() => setLoading(false));
+    }, [recipeId]);
+
+    return (
+        <Dialog open={!!recipeId} onOpenChange={(v) => !v && onClose()}>
+            <DialogContent className="bg-white border-stoke rounded-2xl max-w-2xl max-h-[90vh] overflow-y-auto p-0" data-testid="recipe-dialog">
+                {loading || !recipe ? (
+                    <div className="p-10 flex items-center justify-center">
+                        <Loader2 className="h-5 w-5 animate-spin text-sage" />
+                    </div>
+                ) : (
+                    <>
+                        {recipe.thumbnail && (
+                            <div className="aspect-[16/9] overflow-hidden bg-bg-muted" data-recipe-thumb>
+                                <img
+                                    src={recipe.thumbnail}
+                                    alt={recipe.title}
+                                    className="w-full h-full object-cover"
+                                    referrerPolicy="no-referrer"
+                                    onError={(e) => {
+                                        const wrap = e.currentTarget.closest("[data-recipe-thumb]");
+                                        if (wrap) wrap.style.display = "none";
+                                    }}
+                                />
+                            </div>
+                        )}
+                        <div className="p-7">
+                            <DialogHeader>
+                                <p className="text-xs tracking-[0.18em] uppercase font-bold text-terracotta mb-1">
+                                    {recipe.cuisine || "Recipe"}{recipe.servings && ` · Serves ${recipe.servings}`}
+                                </p>
+                                <DialogTitle className="font-display text-2xl text-ink tracking-tight">
+                                    {recipe.title}
+                                </DialogTitle>
+                                {recipe.summary && (
+                                    <DialogDescription className="text-ink-secondary text-[15px] leading-relaxed">
+                                        {recipe.summary}
+                                    </DialogDescription>
+                                )}
+                            </DialogHeader>
+                            {recipe.source_owner && (
+                                <p className="text-xs text-ink-muted mt-2">
+                                    Shared by {recipe.shared_by} · via @{recipe.source_owner}
+                                </p>
+                            )}
+
+                            <div className="mt-6">
+                                <p className="text-xs tracking-[0.18em] uppercase font-bold text-ink-muted mb-3">
+                                    Ingredients ({recipe.ingredients?.length || 0})
+                                </p>
+                                <ul className="space-y-1.5">
+                                    {(recipe.ingredients || []).map((ing, i) => (
+                                        <li key={i} className="flex items-baseline justify-between gap-3 text-sm py-1 border-b border-stoke last:border-0" data-testid={`recipe-ingredient-${i}`}>
+                                            <span className="text-ink">{ing.name}</span>
+                                            <span className="text-ink-muted text-xs whitespace-nowrap">{ing.qty}</span>
+                                        </li>
+                                    ))}
+                                </ul>
+                            </div>
+
+                            {recipe.steps?.length > 0 && (
+                                <div className="mt-6">
+                                    <p className="text-xs tracking-[0.18em] uppercase font-bold text-ink-muted mb-3">
+                                        Steps
+                                    </p>
+                                    <ol className="space-y-3">
+                                        {recipe.steps.map((s, i) => (
+                                            <li key={i} className="flex gap-3 text-[15px]" data-testid={`recipe-step-${i}`}>
+                                                <span className="shrink-0 inline-flex h-6 w-6 items-center justify-center rounded-full bg-sage text-white text-xs font-semibold">
+                                                    {i + 1}
+                                                </span>
+                                                <span className="text-ink-secondary leading-relaxed">{s}</span>
+                                            </li>
+                                        ))}
+                                    </ol>
+                                </div>
+                            )}
+
+                            <div className="mt-7 flex flex-wrap items-center gap-3">
+                                <Link to="/app/cart" data-testid="recipe-view-cart">
+                                    <Button className="rounded-full bg-sage hover:bg-sage-hover text-white">
+                                        <ShoppingCart className="h-4 w-4 mr-2" />
+                                        View cart
+                                    </Button>
+                                </Link>
+                                {recipe.source_url && (
+                                    <a href={recipe.source_url} target="_blank" rel="noopener noreferrer" data-testid="recipe-source-link">
+                                        <Button variant="outline" className="rounded-full border-stoke bg-white hover:bg-bg-muted text-ink hover:text-ink">
+                                            <ExternalLink className="h-4 w-4 mr-2" />
+                                            Open on Instagram
+                                        </Button>
+                                    </a>
+                                )}
+                            </div>
+                        </div>
+                    </>
+                )}
+            </DialogContent>
+        </Dialog>
+    );
+}
+
+function MessageBubble({ msg, currentUserId, onRecipeClick }) {
     const isMine = msg.sender_id === currentUserId;
     const isSystem = msg.role === "system";
     const isJarvis = msg.role === "assistant";
     const isCartProposal = msg.role === "cart_proposal";
+    const isRecipe = msg.role === "recipe";
 
     if (isSystem) {
         return (
@@ -368,6 +489,67 @@ function MessageBubble({ msg, currentUserId }) {
                 <span className="bg-white/90 rounded-full px-3 py-1 text-[11px] text-ink-secondary shadow-sm max-w-[80%] text-center">
                     {msg.content}
                 </span>
+            </div>
+        );
+    }
+
+    if (isRecipe) {
+        return (
+            <div className="flex justify-start mb-2" data-testid="recipe-message">
+                <button
+                    onClick={() => onRecipeClick(msg.recipe_id)}
+                    className="max-w-[88%] rounded-2xl rounded-bl-md bg-white border border-sage/30 shadow-sm overflow-hidden text-left hover:border-sage transition-colors group"
+                    data-testid={`recipe-card-${msg.recipe_id}`}
+                >
+                    <div className="px-4 pt-3 pb-2 flex items-center gap-2">
+                        <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-terracotta text-white">
+                            <Sparkles className="h-3 w-3" />
+                        </span>
+                        <p className="font-semibold text-sm text-terracotta">Jarvis</p>
+                        <span className="text-[10px] uppercase tracking-[0.15em] font-bold text-ink-muted ml-auto">
+                            recipe
+                        </span>
+                    </div>
+                    {msg.recipe_thumbnail && (
+                        <div className="aspect-[16/10] overflow-hidden bg-bg-muted" data-recipe-thumb>
+                            <img
+                                src={msg.recipe_thumbnail}
+                                alt={msg.recipe_title}
+                                className="w-full h-full object-cover group-hover:scale-[1.02] transition-transform duration-300"
+                                referrerPolicy="no-referrer"
+                                onError={(e) => {
+                                    const wrap = e.currentTarget.closest("[data-recipe-thumb]");
+                                    if (wrap) wrap.style.display = "none";
+                                }}
+                            />
+                        </div>
+                    )}
+                    <div className="px-4 py-3 space-y-1">
+                        <p className="font-display text-base font-semibold text-ink leading-snug">
+                            {msg.recipe_title}
+                        </p>
+                        {msg.recipe_summary && (
+                            <p className="text-sm text-ink-secondary leading-snug line-clamp-2">
+                                {msg.recipe_summary}
+                            </p>
+                        )}
+                        {msg.source_owner && (
+                            <p className="text-xs text-ink-muted">
+                                via @{msg.source_owner}
+                            </p>
+                        )}
+                    </div>
+                    <div className="bg-bg-base hover:bg-bg-muted transition-colors px-4 py-2.5 flex items-center justify-between border-t border-stoke">
+                        <span className="text-xs font-semibold text-sage flex items-center gap-1.5">
+                            <UtensilsCrossed className="h-3.5 w-3.5" />
+                            {msg.ingredients_count} ingredients added to cart
+                        </span>
+                        <span className="text-sage text-sm">View →</span>
+                    </div>
+                    <div className="px-4 pb-2 text-right">
+                        <span className="text-[10px] text-ink-muted">{formatTime(msg.created_at)}</span>
+                    </div>
+                </button>
             </div>
         );
     }

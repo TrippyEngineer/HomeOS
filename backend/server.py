@@ -6,6 +6,7 @@ import os
 import re
 import json
 import uuid
+import asyncio
 import secrets
 import random
 import logging
@@ -15,6 +16,7 @@ from typing import Optional, List
 
 import jwt
 import bcrypt
+import instaloader
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
@@ -595,6 +597,250 @@ Decide what to do. Respond with JSON only.
         return {"should_reply": False, "reply": "", "extracted_items": []}
 
 
+# -------- Instagram recipe ingestion (instaloader, anonymous) --------
+INSTAGRAM_URL_PATTERN = re.compile(
+    r"https?://(?:www\.)?instagram\.com/(?:reel|reels|p|tv)/([A-Za-z0-9_-]+)",
+    re.IGNORECASE,
+)
+
+
+def _extract_ig_shortcode(text: str) -> Optional[str]:
+    m = INSTAGRAM_URL_PATTERN.search(text or "")
+    return m.group(1) if m else None
+
+
+def _fetch_ig_post_sync(shortcode: str) -> Optional[dict]:
+    """Synchronous instaloader fetch — run in a thread executor."""
+    try:
+        L = instaloader.Instaloader(
+            quiet=True,
+            download_pictures=False,
+            download_videos=False,
+            download_video_thumbnails=False,
+            download_comments=False,
+            save_metadata=False,
+            compress_json=False,
+            request_timeout=10,
+        )
+        post = instaloader.Post.from_shortcode(L.context, shortcode)
+        return {
+            "shortcode": shortcode,
+            "caption": post.caption or "",
+            "owner": post.owner_username,
+            "thumbnail": str(post.url) if post.url else None,
+            "is_video": bool(post.is_video),
+            "video_url": str(post.video_url) if post.is_video and post.video_url else None,
+            "url": f"https://www.instagram.com/p/{shortcode}/",
+        }
+    except Exception as e:
+        logger.warning(f"instaloader failed for {shortcode}: {e}")
+        return None
+
+
+def _fetch_ig_embed_sync(shortcode: str) -> Optional[dict]:
+    """Fallback: scrape Instagram's public embed page for og:description / og:image."""
+    import urllib.request
+    import html as html_mod
+    try:
+        url = f"https://www.instagram.com/p/{shortcode}/embed/captioned/"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            body = r.read().decode("utf-8", errors="ignore")
+        if "EmbedIsBroken" in body:
+            return None
+        og_desc = re.search(r'<meta property="og:description" content="([^"]+)"', body)
+        og_img = re.search(r'<meta property="og:image" content="([^"]+)"', body)
+        og_title = re.search(r'<meta property="og:title" content="([^"]+)"', body)
+        owner_m = re.search(r"@([A-Za-z0-9_.]+)", html_mod.unescape(og_title.group(1)) if og_title else "")
+        caption = ""
+        if og_desc:
+            caption = html_mod.unescape(og_desc.group(1))
+            # og:description often is like:  "1,234 likes, 56 comments - username on Date: \"actual caption...\""
+            cap_match = re.search(r':\s*"(.+)"\s*$', caption, re.DOTALL) or re.search(r'-\s*[^:]+:\s*(.+)$', caption, re.DOTALL)
+            if cap_match:
+                caption = cap_match.group(1).strip().strip('"')
+        if not caption:
+            return None
+        return {
+            "shortcode": shortcode,
+            "caption": caption,
+            "owner": owner_m.group(1) if owner_m else None,
+            "thumbnail": html_mod.unescape(og_img.group(1)) if og_img else None,
+            "is_video": False,
+            "video_url": None,
+            "url": f"https://www.instagram.com/p/{shortcode}/",
+        }
+    except Exception as e:
+        logger.warning(f"embed fallback failed for {shortcode}: {e}")
+        return None
+
+
+async def _fetch_ig_post(shortcode: str) -> Optional[dict]:
+    # Primary: instaloader (works for richer posts but often blocked from cloud IPs)
+    result = await asyncio.get_event_loop().run_in_executor(None, _fetch_ig_post_sync, shortcode)
+    if result and result.get("caption"):
+        return result
+    # Fallback: public embed page scrape (no auth, works for many public posts)
+    return await asyncio.get_event_loop().run_in_executor(None, _fetch_ig_embed_sync, shortcode)
+
+
+async def _extract_recipe_from_caption(caption: str) -> Optional[dict]:
+    if not EMERGENT_LLM_KEY or not caption:
+        return None
+    prompt = f"""Extract a recipe from this Instagram caption. It may be a cooking reel (Indian or global cuisine).
+
+Caption:
+\"\"\"{caption[:3000]}\"\"\"
+
+If this is clearly NOT a recipe (e.g., travel, fashion, news, meme), return: {{"is_recipe": false}}
+
+Otherwise return strict JSON only:
+{{
+  "is_recipe": true,
+  "title": "short dish name",
+  "cuisine": "indian|global|other",
+  "servings": "2-4" or similar,
+  "ingredients": [{{"name": "toor dal", "qty": "1 cup"}}, ...],
+  "steps": ["step 1 sentence", "step 2 sentence", ...],
+  "summary": "1-2 sentence summary of the dish"
+}}
+
+Limit ingredients to <= 20 items. Limit steps to <= 10. Use Indian units when relevant (cup, tsp, tbsp, kg, g).
+"""
+    try:
+        llm = LlmChat(
+            api_key=EMERGENT_LLM_KEY,
+            session_id=f"recipe-{uuid.uuid4()}",
+            system_message="You extract structured recipes. Output strictly valid JSON only, no markdown.",
+        ).with_model(LLM_MODEL[0], LLM_MODEL[1])
+        raw = await llm.send_message(UserMessage(text=prompt))
+        text = raw if isinstance(raw, str) else str(raw)
+        text = text.strip()
+        if text.startswith("```"):
+            text = text.split("```", 2)[1]
+            if text.startswith("json"):
+                text = text[4:]
+            text = text.strip("` \n")
+        data = json.loads(text)
+        if not data.get("is_recipe"):
+            return None
+        # Normalize ingredients to dicts
+        ings = []
+        for ing in data.get("ingredients", [])[:20]:
+            if isinstance(ing, dict):
+                ings.append({"name": str(ing.get("name", "")).strip(), "qty": str(ing.get("qty", "1")).strip()})
+            elif isinstance(ing, str):
+                ings.append({"name": ing.strip(), "qty": "1"})
+        data["ingredients"] = [i for i in ings if i["name"]]
+        return data
+    except Exception as e:
+        logger.error(f"recipe extract error: {e}")
+        return None
+
+
+async def _process_instagram_link(household_id: str, user: dict, content: str) -> List[dict]:
+    """Detect IG URL in content, fetch caption, extract recipe, add to cart, post recipe card.
+    Returns list of new chat messages (may be empty if no IG link)."""
+    shortcode = _extract_ig_shortcode(content)
+    if not shortcode:
+        return []
+
+    ig = await _fetch_ig_post(shortcode)
+
+    if not ig or not ig.get("caption"):
+        # Couldn't read it — post a friendly note
+        err = {
+            "id": str(uuid.uuid4()),
+            "household_id": household_id,
+            "sender_id": JARVIS_ID,
+            "sender_name": "Jarvis",
+            "sender_color": "#D97757",
+            "role": "assistant",
+            "content": (
+                "I saw the Instagram link but couldn't fetch the caption — the post might be private, "
+                "deleted, or Instagram is rate-limiting anonymous reads. If you paste the recipe text, I'll pull ingredients."
+            ),
+            "created_at": now_iso(),
+        }
+        await db.chat_messages.insert_one(err)
+        return [strip_id(err)]
+
+    recipe = await _extract_recipe_from_caption(ig["caption"])
+
+    if not recipe:
+        err = {
+            "id": str(uuid.uuid4()),
+            "household_id": household_id,
+            "sender_id": JARVIS_ID,
+            "sender_name": "Jarvis",
+            "sender_color": "#D97757",
+            "role": "assistant",
+            "content": f"I read the Instagram caption from @{ig.get('owner', '')} but couldn't pull a clear recipe out. Send the dish name and I'll help.",
+            "created_at": now_iso(),
+        }
+        await db.chat_messages.insert_one(err)
+        return [strip_id(err)]
+
+    # Save recipe doc
+    recipe_doc = {
+        "id": str(uuid.uuid4()),
+        "household_id": household_id,
+        "title": recipe.get("title", "Untitled recipe"),
+        "cuisine": recipe.get("cuisine", ""),
+        "servings": recipe.get("servings", ""),
+        "summary": recipe.get("summary", ""),
+        "ingredients": recipe.get("ingredients", []),
+        "steps": recipe.get("steps", []),
+        "source_url": ig.get("url"),
+        "source_owner": ig.get("owner"),
+        "thumbnail": ig.get("thumbnail"),
+        "video_url": ig.get("video_url"),
+        "shared_by": user["name"],
+        "shared_by_id": user["id"],
+        "created_at": now_iso(),
+    }
+    await db.recipes.insert_one(recipe_doc)
+    strip_id(recipe_doc)
+
+    # Add ingredients to draft cart (silently)
+    items = [
+        {"name": i["name"], "qty": i.get("qty", "1"), "note": f"for {recipe_doc['title']}"}
+        for i in recipe_doc["ingredients"]
+    ]
+    if items:
+        await _add_items_to_draft(household_id, items, user["name"], source="instagram")
+
+    # Post recipe-card message
+    card = {
+        "id": str(uuid.uuid4()),
+        "household_id": household_id,
+        "sender_id": JARVIS_ID,
+        "sender_name": "Jarvis",
+        "sender_color": "#D97757",
+        "role": "recipe",
+        "content": (
+            f"Pulled the recipe for {recipe_doc['title']} from @{ig.get('owner', '')}. "
+            f"{len(items)} ingredients added to the cart."
+        ),
+        "recipe_id": recipe_doc["id"],
+        "recipe_title": recipe_doc["title"],
+        "recipe_thumbnail": recipe_doc.get("thumbnail"),
+        "recipe_summary": recipe_doc.get("summary", ""),
+        "ingredients_count": len(items),
+        "source_owner": ig.get("owner"),
+        "created_at": now_iso(),
+    }
+    await db.chat_messages.insert_one(card)
+    return [strip_id(card)]
+
+
+
 async def _get_or_create_draft_cart(household_id: str):
     cart = await db.carts.find_one(
         {"household_id": household_id, "status": "draft"}, {"_id": 0}
@@ -694,31 +940,35 @@ async def send_chat(payload: ChatReq, user=Depends(get_current_user)):
 
     new_msgs = [strip_id(user_msg)]
 
-    # Run Jarvis logic
-    decision = await _run_jarvis(household_id, user["name"], content)
-
-    # Add extracted items to draft cart silently
-    cart_updated = False
-    if decision["extracted_items"]:
-        await _add_items_to_draft(
-            household_id, decision["extracted_items"], user["name"], source="jarvis"
-        )
+    # Check for Instagram link first — if found, extract recipe instead of running normal Jarvis flow
+    ig_messages = await _process_instagram_link(household_id, user, content)
+    if ig_messages:
+        new_msgs.extend(ig_messages)
         cart_updated = True
+    else:
+        # Run Jarvis logic (chat)
+        decision = await _run_jarvis(household_id, user["name"], content)
 
-    # Save Jarvis reply if any
-    if decision["should_reply"] and decision["reply"]:
-        bot_msg = {
-            "id": str(uuid.uuid4()),
-            "household_id": household_id,
-            "sender_id": JARVIS_ID,
-            "sender_name": "Jarvis",
-            "sender_color": "#D97757",
-            "role": "assistant",
-            "content": decision["reply"],
-            "created_at": now_iso(),
-        }
-        await db.chat_messages.insert_one(bot_msg)
-        new_msgs.append(strip_id(bot_msg))
+        cart_updated = False
+        if decision["extracted_items"]:
+            await _add_items_to_draft(
+                household_id, decision["extracted_items"], user["name"], source="jarvis"
+            )
+            cart_updated = True
+
+        if decision["should_reply"] and decision["reply"]:
+            bot_msg = {
+                "id": str(uuid.uuid4()),
+                "household_id": household_id,
+                "sender_id": JARVIS_ID,
+                "sender_name": "Jarvis",
+                "sender_color": "#D97757",
+                "role": "assistant",
+                "content": decision["reply"],
+                "created_at": now_iso(),
+            }
+            await db.chat_messages.insert_one(bot_msg)
+            new_msgs.append(strip_id(bot_msg))
 
     # Auto cart proposal: if draft cart has >=4 items and no recent cart proposal
     if cart_updated:
@@ -770,6 +1020,25 @@ async def list_carts(user=Depends(get_current_user)):
     return await db.carts.find(
         {"household_id": user["household_id"]}, {"_id": 0}
     ).sort("created_at", -1).limit(20).to_list(20)
+
+
+# -------- Recipes (Instagram-extracted + future) --------
+@api.get("/recipes")
+async def list_recipes(user=Depends(get_current_user)):
+    return await db.recipes.find(
+        {"household_id": user["household_id"]}, {"_id": 0}
+    ).sort("created_at", -1).limit(50).to_list(50)
+
+
+@api.get("/recipes/{recipe_id}")
+async def get_recipe(recipe_id: str, user=Depends(get_current_user)):
+    r = await db.recipes.find_one(
+        {"id": recipe_id, "household_id": user["household_id"]}, {"_id": 0}
+    )
+    if not r:
+        raise HTTPException(404, "Recipe not found")
+    return r
+
 
 
 @api.post("/cart/item")
