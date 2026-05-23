@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { Input } from "@/components/ui/input";
 import {
-    Dialog, DialogContent, DialogHeader, DialogTitle,
+    Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription,
 } from "@/components/ui/dialog";
 import { toast } from "sonner";
 import {
@@ -289,6 +289,9 @@ export default function ChatPage() {
                         <DialogTitle className="font-display text-2xl text-ink">
                             {householdData?.name}
                         </DialogTitle>
+                        <DialogDescription className="text-ink-secondary">
+                            Your household members and invite code.
+                        </DialogDescription>
                     </DialogHeader>
                     <div className="space-y-5">
                         <div>

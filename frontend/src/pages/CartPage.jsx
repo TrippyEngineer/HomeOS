@@ -198,7 +198,7 @@ export default function CartPage() {
                     <Button
                         onClick={checkout}
                         disabled={checkingOut}
-                        className="rounded-full bg-terracotta hover:bg-terracotta-hover text-white h-12 px-7"
+                        className="rounded-full bg-terracotta hover:bg-terracotta-hover text-white h-12 px-7 shadow-md ring-1 ring-terracotta/40"
                         data-testid="checkout-button"
                     >
                         {checkingOut ? (
