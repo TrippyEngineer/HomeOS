@@ -1200,6 +1200,7 @@ async def recipe_from_text(payload: TextRecipeReq, user=Depends(get_current_user
     await _broadcast_message(card)
     return {"recipe": recipe_doc, "message": card}
 
+
 @api.post("/cart/item")
 async def add_cart_item(payload: CartItem, user=Depends(get_current_user)):
     cart = await _get_or_create_draft_cart(user["household_id"])
