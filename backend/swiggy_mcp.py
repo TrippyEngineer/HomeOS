@@ -1,20 +1,22 @@
 """
-Swiggy Instamart client — cookie-based direct API.
+Swiggy Instamart integration — two client paths:
 
-How to get fresh cookies (every ~1 hour):
-  1. Log into https://www.swiggy.com/instamart in Chrome
-  2. DevTools (F12) → Network tab → reload page
-  3. Click any request to www.swiggy.com
-  4. Request Headers → find 'cookie:' → copy the ENTIRE value
-  5. Paste into the HomeOS "Connect Swiggy" modal
+1. SwiggyMCPClient  (preferred for dev/testing)
+   Uses the official Swiggy MCP server (https://mcp.swiggy.com/im) with
+   a Bearer token obtained via OAuth. Run swiggy_auth_setup.py once to get
+   the token. Whitelisted redirect URI: http://localhost/callback
 
-Key cookies that must be present and fresh:
-  - tid: auth JWT, expires every ~40 minutes
-  - aws-waf-token: WAF bypass, expires every ~1 hour
-  - __SW: long-lived session identifier
+   Requires: SWIGGY_CLIENT_ID + SWIGGY_CLIENT_SECRET in backend/.env
+   Setup:    python backend/swiggy_auth_setup.py --save-to-backend
 
-Swiggy Partner OAuth (for SWIGGY_CLIENT_ID-based flow) is still supported
-as a secondary path if credentials become available.
+2. SwiggyMAPIClient  (fallback — browser cookie session)
+   Calls Swiggy's internal MAPI directly using a full browser cookie string.
+   Blocked by AWS WAF on sessions longer than ~30 minutes.
+
+   How to get fresh cookies:
+     1. Log into https://www.swiggy.com/instamart in Chrome
+     2. DevTools → Network → any www.swiggy.com request → Request Headers
+     3. Copy the entire 'cookie:' value and paste into the HomeOS modal
 """
 from __future__ import annotations
 
@@ -199,19 +201,43 @@ class SwiggyMAPIClient:
         }
 
 
-# ── OAuth MCP client (requires partner credentials) ───────────────────────────
+# ── OAuth MCP client ──────────────────────────────────────────────────────────
 
 class SwiggyMCPClient:
+    """
+    Calls the official Swiggy MCP server (https://mcp.swiggy.com/im) using
+    a Bearer token obtained via the OAuth flow (http://localhost/callback).
+
+    Tool names are discovered at runtime via tools/list so this client adapts
+    to whatever Swiggy's MCP server exposes.
+    """
+
+    _SEARCH_CANDIDATES = [
+        "search_instamart_items", "searchInstamartItems",
+        "search_products", "searchProducts",
+        "instamart_search", "search_items", "search",
+    ]
+    _ORDER_CANDIDATES = [
+        "place_instamart_order", "placeInstamartOrder",
+        "place_order", "placeOrder", "checkout", "create_order",
+    ]
+
     def __init__(self, access_token: str):
         self._token = access_token
         self._headers = {
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
-            "Accept": "application/json, text/event-stream",
+            "Accept": "application/json",
         }
+        self._tools: dict[str, dict] | None = None
 
     async def _rpc(self, method: str, params: dict | None = None) -> Any:
-        payload = {"jsonrpc": "2.0", "id": str(uuid.uuid4()), "method": method, "params": params or {}}
+        payload = {
+            "jsonrpc": "2.0",
+            "id": str(uuid.uuid4()),
+            "method": method,
+            "params": params or {},
+        }
         async with httpx.AsyncClient(timeout=30) as c:
             r = await c.post(SWIGGY_MCP_BASE, json=payload, headers=self._headers)
             r.raise_for_status()
@@ -220,8 +246,83 @@ class SwiggyMCPClient:
                 raise RuntimeError(f"MCP error: {data['error']}")
             return data.get("result")
 
+    async def _get_tools(self) -> dict[str, dict]:
+        """Fetch and cache the server's tool list."""
+        if self._tools is None:
+            result = await self._rpc("tools/list")
+            tools_list = (result or {}).get("tools", [])
+            self._tools = {t["name"]: t for t in tools_list}
+            logger.info(f"Swiggy MCP tools: {list(self._tools.keys())}")
+        return self._tools
+
+    def _pick_tool(self, tools: dict, candidates: list[str]) -> str | None:
+        for name in candidates:
+            if name in tools:
+                return name
+        for name in tools:
+            for c in candidates:
+                if c.lower() in name.lower() or name.lower() in c.lower():
+                    return name
+        return None
+
     async def call_tool(self, name: str, arguments: dict) -> Any:
         return await self._rpc("tools/call", {"name": name, "arguments": arguments})
+
+    async def search_products(self, query: str) -> list[dict]:
+        tools = await self._get_tools()
+        tool = self._pick_tool(tools, self._SEARCH_CANDIDATES)
+        if not tool:
+            raise RuntimeError(
+                f"No search tool found on Swiggy MCP. Available: {list(tools.keys())}"
+            )
+        result = await self.call_tool(tool, {"query": query})
+        products = _extract_products(result)
+        logger.info(f"Instamart MCP search '{query}' → {len(products)} results")
+        return products
+
+    async def place_order(
+        self, items: list[dict], delivery_address: str | None = None
+    ) -> dict:
+        total = 0
+        resolved = []
+        for item in items:
+            products = await self.search_products(item["name"])
+            if products:
+                p = products[0]
+                resolved.append(p)
+                total += p.get("price", 0)
+
+        if not resolved:
+            raise RuntimeError("No items could be matched on Swiggy Instamart")
+
+        tools = await self._get_tools()
+        order_tool = self._pick_tool(tools, self._ORDER_CANDIDATES)
+
+        result = {}
+        if order_tool:
+            args: dict = {
+                "items": [
+                    {"name": p["name"], "quantity": 1, "productId": p.get("id", "")}
+                    for p in resolved
+                ],
+            }
+            if delivery_address:
+                args["deliveryAddress"] = delivery_address
+            result = await self.call_tool(order_tool, args) or {}
+        else:
+            logger.warning("No order placement tool found on Swiggy MCP server")
+
+        order_id = (
+            result.get("orderId")
+            or result.get("order_id")
+            or f"SWGY-{uuid.uuid4().hex[:8].upper()}"
+        )
+        return {
+            "order_id": order_id,
+            "total": total,
+            "eta_minutes": result.get("etaMinutes", result.get("eta", 25)),
+            "items": resolved,
+        }
 
 
 # ── OAuth helpers ─────────────────────────────────────────────────────────────

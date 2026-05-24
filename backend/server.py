@@ -30,7 +30,7 @@ from openai import AsyncOpenAI
 from fastapi.responses import RedirectResponse
 
 from broadcaster import broadcaster
-from swiggy_mcp import SwiggyMAPIClient, build_auth_url, exchange_code_for_token
+from swiggy_mcp import SwiggyMAPIClient, SwiggyMCPClient, build_auth_url, exchange_code_for_token
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -1266,9 +1266,13 @@ def _mock_swiggy_price(name: str) -> int:
     return random.choice([60, 80, 120, 150, 200, 250])
 
 
+async def _get_swiggy_record(household_id: str) -> dict | None:
+    """Retrieve the stored Swiggy token record for this household."""
+    return await db.swiggy_tokens.find_one({"household_id": household_id}, {"_id": 0})
+
+
 async def _get_swiggy_token(household_id: str) -> str | None:
-    """Retrieve the stored Swiggy OAuth token for this household."""
-    rec = await db.swiggy_tokens.find_one({"household_id": household_id}, {"_id": 0})
+    rec = await _get_swiggy_record(household_id)
     return rec.get("access_token") if rec else None
 
 
@@ -1321,6 +1325,7 @@ async def swiggy_callback(code: str, state: str, request: Request):
             "access_token": token_data["access_token"],
             "refresh_token": token_data.get("refresh_token"),
             "expires_in": token_data.get("expires_in"),
+            "token_type": "oauth",
             "saved_at": now_iso(),
         }},
         upsert=True,
@@ -1337,23 +1342,27 @@ async def swiggy_disconnect(user=Depends(get_current_user)):
 
 class SwiggyTokenReq(BaseModel):
     token: str
+    token_type: str = "cookie"  # "cookie" (browser session) or "oauth" (MCP Bearer)
 
 
 @api.post("/swiggy/set-token")
 async def swiggy_set_token(req: SwiggyTokenReq, user=Depends(get_current_user)):
     """
-    Save a Swiggy bearer token obtained from the browser session.
-    Used when Swiggy OAuth credentials are not yet configured.
+    Save a Swiggy token for this household.
+    token_type="cookie"  → browser cookie string (SwiggyMAPIClient)
+    token_type="oauth"   → Bearer token from OAuth flow (SwiggyMCPClient)
     """
     if not req.token.strip():
         raise HTTPException(400, "Token cannot be empty")
+    if req.token_type not in ("cookie", "oauth"):
+        raise HTTPException(400, "token_type must be 'cookie' or 'oauth'")
     await db.swiggy_tokens.update_one(
         {"household_id": user["household_id"]},
         {"$set": {
             "household_id": user["household_id"],
             "access_token": req.token.strip(),
             "refresh_token": None,
-            "source": "manual",
+            "token_type": req.token_type,
             "saved_at": now_iso(),
         }},
         upsert=True,
@@ -1380,16 +1389,20 @@ async def checkout_swiggy(cart_id: str, user=Depends(get_current_user)):
     if not cart.get("items"):
         raise HTTPException(400, "Cart is empty")
 
-    token = await _get_swiggy_token(user["household_id"])
+    record = await _get_swiggy_record(user["household_id"])
+    token = record.get("access_token") if record else None
+    token_type = (record or {}).get("token_type", "cookie")
 
     if token:
-        # ── Real Swiggy order via MAPI (cookie auth) ───────────────────
+        # ── Real Swiggy order — OAuth MCP or cookie MAPI ───────────────
         try:
             household = await db.households.find_one(
                 {"id": user["household_id"]}, {"_id": 0}
             )
             address = (household or {}).get("delivery_address")
-            swiggy = SwiggyMAPIClient(token)
+            swiggy: SwiggyMAPIClient | SwiggyMCPClient = (
+                SwiggyMCPClient(token) if token_type == "oauth" else SwiggyMAPIClient(token)
+            )
             confirmation = await swiggy.place_order(cart["items"], delivery_address=address)
 
             order_id = confirmation.get("order_id", f"SWGY-{secrets.token_hex(4).upper()}")
