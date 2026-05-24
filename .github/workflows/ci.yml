@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ── Backend: lint + integration tests ─────────────────────────────────────
+  backend:
+    name: Backend (Python 3.11)
+    runs-on: ubuntu-latest
+
+    services:
+      mongodb:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --eval 'db.runCommand({ping:1})'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install dependencies
+        working-directory: backend
+        run: pip install -r requirements.txt
+
+      - name: Lint (flake8)
+        working-directory: backend
+        run: |
+          flake8 server.py orchestrator.py broadcaster.py swiggy_mcp.py \
+            --max-line-length=120 \
+            --ignore=E501,W503,E402
+
+      - name: Create .env
+        working-directory: backend
+        run: |
+          printf 'MONGO_URL=mongodb://localhost:27017\n' > .env
+          printf 'DB_NAME=homeos_ci\n' >> .env
+          printf 'JWT_SECRET=ci-test-secret-homeos-pipeline\n' >> .env
+          printf 'CORS_ORIGINS=*\n' >> .env
+
+      - name: Start backend
+        working-directory: backend
+        run: |
+          uvicorn server:app --port 8000 > /tmp/uvicorn.log 2>&1 &
+          echo "Waiting for backend to be ready..."
+          for i in $(seq 1 20); do
+            if curl -sf http://localhost:8000/api/ > /dev/null; then
+              echo "Backend ready after $i attempts."
+              break
+            fi
+            echo "Attempt $i: not ready yet..."
+            sleep 3
+          done
+          curl -sf http://localhost:8000/api/ > /dev/null || {
+            echo "=== Backend failed to start. uvicorn log: ==="
+            cat /tmp/uvicorn.log
+            exit 1
+          }
+
+      - name: Run tests
+        working-directory: backend
+        env:
+          REACT_APP_BACKEND_URL: http://localhost:8000
+        run: pytest tests/ -v --tb=short --no-header
+
+  # ── Frontend: install + build check ───────────────────────────────────────
+  frontend:
+    name: Frontend (Node 22)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Enable Corepack (Yarn)
+        run: corepack enable
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: yarn install --frozen-lockfile
+
+      - name: Build
+        working-directory: frontend
+        env:
+          REACT_APP_BACKEND_URL: http://localhost:8000
+          CI: "false"
+        run: yarn build

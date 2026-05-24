@@ -13,8 +13,11 @@ from pathlib import Path
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
-BASE_URL = os.environ["REACT_APP_BACKEND_URL"].rstrip("/") if os.environ.get("REACT_APP_BACKEND_URL") else "https://home-agent-2.preview.emergentagent.com"
+BASE_URL = os.environ.get("REACT_APP_BACKEND_URL", "http://localhost:8000").rstrip("/")
 API = f"{BASE_URL}/api"
+
+_HAS_LLM = bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("XAI_API_KEY"))
+needs_ai = pytest.mark.skipif(not _HAS_LLM, reason="No LLM API key — set ANTHROPIC_API_KEY or XAI_API_KEY to run AI tests")
 
 # Unique user creds per session run so we can re-run tests without DB cleanup
 RUN_ID = uuid.uuid4().hex[:6]
@@ -129,6 +132,7 @@ def test_chat_history_initial(session):
     assert any(m["role"] == "system" for m in msgs)
 
 
+@needs_ai
 def test_chat_silent_for_casual(session):
     """Casual greeting should NOT get a Jarvis reply."""
     r = session.post(f"{API}/chat", json={"content": "hello everyone good morning"},
@@ -140,6 +144,7 @@ def test_chat_silent_for_casual(session):
     assert len(assistant_msgs) == 0, f"Jarvis should stay silent for casual chat. got: {assistant_msgs}"
 
 
+@needs_ai
 def test_chat_silent_extracts_grocery(session):
     """Plain statement of being out of dal -> silent extraction (no reply) but cart should grow."""
     r = session.post(f"{API}/chat", json={"content": "we are out of toor dal"},
@@ -152,6 +157,7 @@ def test_chat_silent_extracts_grocery(session):
     assert any("toor" in n or "dal" in n for n in names), f"Expected dal in cart, got {names}"
 
 
+@needs_ai
 def test_chat_question_gets_reply(session):
     """Direct question with 'jarvis' should get a reply."""
     r = session.post(f"{API}/chat",
@@ -164,6 +170,7 @@ def test_chat_question_gets_reply(session):
     assert assistant_msgs[0]["sender_name"] == "Jarvis"
 
 
+@needs_ai
 def test_chat_more_groceries_for_cart_proposal(session):
     """Add a few more grocery items to trigger cart_proposal (>=4 items)."""
     for content in ["curd khatam, need to buy", "need 2 litres milk", "running low on rice and oil"]:
@@ -219,6 +226,7 @@ def test_cart_manual_add_update_delete(session):
     assert not any(it["id"] == iid for it in dele.json()["items"])
 
 
+@needs_ai
 def test_cart_from_chat(session):
     h = auth_headers(state["priya"]["token"])
     r = session.post(f"{API}/cart/from-chat", headers=h)
@@ -231,8 +239,13 @@ def test_cart_from_chat(session):
 def test_checkout_mock_swiggy(session):
     h = auth_headers(state["priya"]["token"])
     cart = session.get(f"{API}/cart", headers=h).json()
+    if len(cart["items"]) == 0:
+        # AI tests were skipped (no LLM key in CI); add a seed item so checkout has something to process
+        session.post(f"{API}/cart/item", json={"name": "CI_test_atta", "qty": "1 kg"}, headers=h)
+        cart = session.get(f"{API}/cart", headers=h).json()
     assert len(cart["items"]) > 0
     cid = cart["id"]
+    state["cart_id"] = cid
     r = session.post(f"{API}/cart/{cid}/checkout", headers=h)
     assert r.status_code == 200, r.text
     body = r.json()

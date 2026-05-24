@@ -1,6 +1,6 @@
 """
 Jarvis for Home - Backend
-WhatsApp-style group chat for households + AI agent + Swiggy (mock) checkout.
+WhatsApp-style group chat for households + AI agent + Swiggy Instamart checkout.
 """
 import os
 import re
@@ -25,10 +25,12 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, EmailStr
 from sse_starlette.sse import EventSourceResponse
 
-from emergentintegrations.llm.chat import LlmChat, UserMessage
+import anthropic
+from openai import AsyncOpenAI
+from fastapi.responses import RedirectResponse
 
 from broadcaster import broadcaster
-from orchestrator import orchestrator, AgentResult
+from swiggy_mcp import SwiggyMAPIClient, SwiggyMCPClient, build_auth_url, exchange_code_for_token
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -38,11 +40,17 @@ logger = logging.getLogger(__name__)
 
 MONGO_URL = os.environ["MONGO_URL"]
 DB_NAME = os.environ["DB_NAME"]
-JWT_SECRET = os.environ.get("JWT_SECRET", "jarvis-home-secret")
+JWT_SECRET = os.environ.get("JWT_SECRET")
+if not JWT_SECRET:
+    raise ValueError("JWT_SECRET is required — set it in backend/.env")
 JWT_ALG = "HS256"
 JWT_EXP_HOURS = 24 * 7
-EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY")
-LLM_MODEL = ("anthropic", "claude-sonnet-4-5-20250929")
+ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY")
+XAI_KEY = os.environ.get("XAI_API_KEY")
+LLM_MODEL = os.environ.get("LLM_MODEL", "claude-sonnet-4-5-20250929")
+GROK_MODEL = os.environ.get("GROK_MODEL", "grok-3-mini")
+SWIGGY_CLIENT_ID = os.environ.get("SWIGGY_CLIENT_ID", "")
+SWIGGY_REDIRECT_URI = os.environ.get("SWIGGY_REDIRECT_URI", "http://localhost:8000/api/swiggy/callback")
 
 # Stable colors assigned to users in a household for chat bubbles (WhatsApp-style)
 USER_COLORS = [
@@ -58,6 +66,39 @@ db = client[DB_NAME]
 app = FastAPI(title="HomeOS API")
 api = APIRouter(prefix="/api")
 security = HTTPBearer()
+_anthropic_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_KEY)
+_grok_client = AsyncOpenAI(api_key=XAI_KEY, base_url="https://api.x.ai/v1") if XAI_KEY else None
+
+
+async def llm_call(system: str, prompt: str, max_tokens: int = 1024) -> str:
+    """
+    Call Claude (primary). Falls back to Grok if Claude fails or is unconfigured.
+    Raises RuntimeError only if both fail.
+    """
+    if ANTHROPIC_KEY:
+        try:
+            resp = await _anthropic_client.messages.create(
+                model=LLM_MODEL,
+                max_tokens=max_tokens,
+                system=system,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return resp.content[0].text
+        except Exception as e:
+            logger.warning(f"Claude failed ({e}), falling back to Grok")
+
+    if _grok_client:
+        resp = await _grok_client.chat.completions.create(
+            model=GROK_MODEL,
+            max_tokens=max_tokens,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        return resp.choices[0].message.content
+
+    raise RuntimeError("No LLM available — set ANTHROPIC_API_KEY or XAI_API_KEY in backend/.env")
 
 
 def now_iso():
@@ -567,7 +608,7 @@ OUTPUT: strictly valid JSON only, no markdown:
 
 
 async def _run_jarvis(household_id: str, sender_name: str, message_text: str) -> dict:
-    if not EMERGENT_LLM_KEY:
+    if not ANTHROPIC_KEY and not _grok_client:
         return {"should_reply": False, "reply": "", "extracted_items": []}
 
     ctx = await get_household_context(household_id)
@@ -589,13 +630,7 @@ LATEST MESSAGE from {sender_name}:
 Decide what to do. Respond with JSON only.
 """
     try:
-        llm = LlmChat(
-            api_key=EMERGENT_LLM_KEY,
-            session_id=f"jarvis-{household_id}-{uuid.uuid4()}",
-            system_message=JARVIS_SYSTEM,
-        ).with_model(LLM_MODEL[0], LLM_MODEL[1])
-        raw = await llm.send_message(UserMessage(text=prompt))
-        text = raw if isinstance(raw, str) else str(raw)
+        text = await llm_call(JARVIS_SYSTEM, prompt, max_tokens=1024)
         text = text.strip()
         if text.startswith("```"):
             text = text.split("```", 2)[1]
@@ -707,7 +742,7 @@ async def _fetch_ig_post(shortcode: str) -> Optional[dict]:
 
 
 async def _extract_recipe_from_caption(caption: str) -> Optional[dict]:
-    if not EMERGENT_LLM_KEY or not caption:
+    if (not ANTHROPIC_KEY and not _grok_client) or not caption:
         return None
     prompt = f"""Extract a recipe from this Instagram caption. It may be a cooking reel (Indian or global cuisine).
 
@@ -730,13 +765,10 @@ Otherwise return strict JSON only:
 Limit ingredients to <= 20 items. Limit steps to <= 10. Use Indian units when relevant (cup, tsp, tbsp, kg, g).
 """
     try:
-        llm = LlmChat(
-            api_key=EMERGENT_LLM_KEY,
-            session_id=f"recipe-{uuid.uuid4()}",
-            system_message="You extract structured recipes. Output strictly valid JSON only, no markdown.",
-        ).with_model(LLM_MODEL[0], LLM_MODEL[1])
-        raw = await llm.send_message(UserMessage(text=prompt))
-        text = raw if isinstance(raw, str) else str(raw)
+        text = await llm_call(
+            "You extract structured recipes. Output strictly valid JSON only, no markdown.",
+            prompt, max_tokens=2048,
+        )
         text = text.strip()
         if text.startswith("```"):
             text = text.split("```", 2)[1]
@@ -858,7 +890,6 @@ async def _process_instagram_link(household_id: str, user: dict, content: str) -
     }
     await db.chat_messages.insert_one(card)
     return [strip_id(card)]
-
 
 
 async def _get_or_create_draft_cart(household_id: str):
@@ -1109,7 +1140,7 @@ async def recipe_from_text(payload: TextRecipeReq, user=Depends(get_current_user
     """Paste-text fallback: extract a recipe from arbitrary user-pasted text using
     the same LLM pipeline as the Instagram path. Adds ingredients to the draft
     cart and posts a recipe card to chat (broadcast over SSE)."""
-    if not EMERGENT_LLM_KEY:
+    if not ANTHROPIC_KEY and not _grok_client:
         raise HTTPException(500, "LLM not configured")
     text = (payload.text or "").strip()
     if len(text) < 30:
@@ -1170,8 +1201,6 @@ async def recipe_from_text(payload: TextRecipeReq, user=Depends(get_current_user
     return {"recipe": recipe_doc, "message": card}
 
 
-
-
 @api.post("/cart/item")
 async def add_cart_item(payload: CartItem, user=Depends(get_current_user)):
     cart = await _get_or_create_draft_cart(user["household_id"])
@@ -1219,9 +1248,8 @@ async def clear_cart(user=Depends(get_current_user)):
     return await db.carts.find_one({"id": cart["id"]}, {"_id": 0})
 
 
-# -------- Swiggy Mock (clearly mocked) --------
-# NOTE: This is a MOCK Swiggy MCP integration for POC purposes only.
-# Real Swiggy MCP / Instamart MCP integration would replace this layer.
+# -------- Swiggy Instamart — OAuth + MCP --------
+
 SWIGGY_PRICE_LOOKUP = {
     "atta": 320, "rice": 180, "toor dal": 220, "moong dal": 200, "chana dal": 180,
     "oil": 180, "ghee": 650, "salt": 30, "sugar": 60, "tea": 280, "milk": 65,
@@ -1238,9 +1266,119 @@ def _mock_swiggy_price(name: str) -> int:
     return random.choice([60, 80, 120, 150, 200, 250])
 
 
+async def _get_swiggy_record(household_id: str) -> dict | None:
+    """Retrieve the stored Swiggy token record for this household."""
+    return await db.swiggy_tokens.find_one({"household_id": household_id}, {"_id": 0})
+
+
+async def _get_swiggy_token(household_id: str) -> str | None:
+    rec = await _get_swiggy_record(household_id)
+    return rec.get("access_token") if rec else None
+
+
+# ── OAuth endpoints ──────────────────────────────────────────────────────────
+
+@api.get("/swiggy/status")
+async def swiggy_status(user=Depends(get_current_user)):
+    """Returns whether this household has a connected Swiggy account."""
+    token = await _get_swiggy_token(user["household_id"])
+    connected = token is not None
+    return {
+        "connected": connected,
+        "client_configured": bool(SWIGGY_CLIENT_ID),
+        "message": (
+            "Swiggy account connected" if connected
+            else "Connect your Swiggy account to enable real Instamart orders"
+        ),
+    }
+
+
+@api.get("/swiggy/auth")
+async def swiggy_auth(user=Depends(get_current_user)):
+    """Start the Swiggy OAuth flow — redirects browser to Swiggy login."""
+    if not SWIGGY_CLIENT_ID:
+        raise HTTPException(501, "SWIGGY_CLIENT_ID not configured in backend/.env")
+    state = f"{user['household_id']}:{secrets.token_hex(16)}"
+    await db.swiggy_oauth_state.insert_one({
+        "state": state,
+        "household_id": user["household_id"],
+        "created_at": now_iso(),
+    })
+    return RedirectResponse(build_auth_url(state))
+
+
+@api.get("/swiggy/callback")
+async def swiggy_callback(code: str, state: str, request: Request):
+    """Swiggy OAuth callback — exchanges code for token and stores it."""
+    stored = await db.swiggy_oauth_state.find_one_and_delete({"state": state})
+    if not stored:
+        raise HTTPException(400, "Invalid or expired OAuth state")
+    household_id = stored["household_id"]
+    try:
+        token_data = await exchange_code_for_token(code)
+    except Exception as e:
+        raise HTTPException(502, f"Swiggy token exchange failed: {e}")
+    await db.swiggy_tokens.update_one(
+        {"household_id": household_id},
+        {"$set": {
+            "household_id": household_id,
+            "access_token": token_data["access_token"],
+            "refresh_token": token_data.get("refresh_token"),
+            "expires_in": token_data.get("expires_in"),
+            "token_type": "oauth",
+            "saved_at": now_iso(),
+        }},
+        upsert=True,
+    )
+    return RedirectResponse("http://localhost:3000/app/cart?swiggy=connected")
+
+
+@api.delete("/swiggy/disconnect")
+async def swiggy_disconnect(user=Depends(get_current_user)):
+    """Remove the stored Swiggy token for this household."""
+    await db.swiggy_tokens.delete_one({"household_id": user["household_id"]})
+    return {"disconnected": True}
+
+
+class SwiggyTokenReq(BaseModel):
+    token: str
+    token_type: str = "cookie"  # "cookie" (browser session) or "oauth" (MCP Bearer)
+
+
+@api.post("/swiggy/set-token")
+async def swiggy_set_token(req: SwiggyTokenReq, user=Depends(get_current_user)):
+    """
+    Save a Swiggy token for this household.
+    token_type="cookie"  → browser cookie string (SwiggyMAPIClient)
+    token_type="oauth"   → Bearer token from OAuth flow (SwiggyMCPClient)
+    """
+    if not req.token.strip():
+        raise HTTPException(400, "Token cannot be empty")
+    if req.token_type not in ("cookie", "oauth"):
+        raise HTTPException(400, "token_type must be 'cookie' or 'oauth'")
+    await db.swiggy_tokens.update_one(
+        {"household_id": user["household_id"]},
+        {"$set": {
+            "household_id": user["household_id"],
+            "access_token": req.token.strip(),
+            "refresh_token": None,
+            "token_type": req.token_type,
+            "saved_at": now_iso(),
+        }},
+        upsert=True,
+    )
+    return {"connected": True, "source": "manual"}
+
+
+# ── Checkout endpoint (real MCP when connected, mock fallback) ───────────────
+
 @api.post("/cart/{cart_id}/checkout")
 async def checkout_swiggy(cart_id: str, user=Depends(get_current_user)):
-    """MOCK Swiggy Instamart checkout. Replace with real MCP integration when available."""
+    """
+    Place a Swiggy Instamart order.
+    Uses real Swiggy MCP when the household has connected their Swiggy account.
+    Falls back to mock pricing when not connected.
+    """
     cart = await db.carts.find_one(
         {"id": cart_id, "household_id": user["household_id"]}, {"_id": 0}
     )
@@ -1251,35 +1389,78 @@ async def checkout_swiggy(cart_id: str, user=Depends(get_current_user)):
     if not cart.get("items"):
         raise HTTPException(400, "Cart is empty")
 
-    # Mock pricing
-    line_items = []
-    subtotal = 0
-    for it in cart["items"]:
-        price = _mock_swiggy_price(it["name"])
-        subtotal += price
-        line_items.append({**it, "price": price})
+    record = await _get_swiggy_record(user["household_id"])
+    token = record.get("access_token") if record else None
+    token_type = (record or {}).get("token_type", "cookie")
 
-    delivery_fee = 29 if subtotal < 500 else 0
-    total = subtotal + delivery_fee
-    order_id = f"SWGY-{secrets.token_hex(4).upper()}"
-    eta = random.randint(15, 35)
+    if token:
+        # ── Real Swiggy order — OAuth MCP or cookie MAPI ───────────────
+        try:
+            household = await db.households.find_one(
+                {"id": user["household_id"]}, {"_id": 0}
+            )
+            address = (household or {}).get("delivery_address")
+            swiggy: SwiggyMAPIClient | SwiggyMCPClient = (
+                SwiggyMCPClient(token) if token_type == "oauth" else SwiggyMAPIClient(token)
+            )
+            confirmation = await swiggy.place_order(cart["items"], delivery_address=address)
 
-    update = {
-        "status": "ordered",
-        "items": line_items,
-        "swiggy_order_id": order_id,
-        "estimated_total": total,
-        "subtotal": subtotal,
-        "delivery_fee": delivery_fee,
-        "eta_minutes": eta,
-        "ordered_at": now_iso(),
-        "ordered_by": user["name"],
-        "mocked": True,
-        "updated_at": now_iso(),
-    }
+            order_id = confirmation.get("order_id", f"SWGY-{secrets.token_hex(4).upper()}")
+            total = confirmation.get("total", 0)
+            eta = confirmation.get("eta_minutes", 25)
+
+            update = {
+                "status": "ordered",
+                "swiggy_order_id": order_id,
+                "estimated_total": total,
+                "eta_minutes": eta,
+                "ordered_at": now_iso(),
+                "ordered_by": user["name"],
+                "mocked": False,
+                "swiggy_confirmation": confirmation,
+                "updated_at": now_iso(),
+            }
+            content = (
+                f"{user['name']} placed a Swiggy Instamart order "
+                f"({len(cart['items'])} items, ₹{total}). "
+                f"ETA {eta} mins. Order ID {order_id}."
+            )
+        except Exception as e:
+            logger.error(f"Swiggy MAPI checkout failed: {e}; falling back to mock")
+            token = None  # trigger mock fallback below
+
+    if not token:
+        # ── Mock fallback ──────────────────────────────────────────────
+        line_items, subtotal = [], 0
+        for it in cart["items"]:
+            price = _mock_swiggy_price(it["name"])
+            subtotal += price
+            line_items.append({**it, "price": price})
+        delivery_fee = 29 if subtotal < 500 else 0
+        total = subtotal + delivery_fee
+        order_id = f"SWGY-{secrets.token_hex(4).upper()}"
+        eta = random.randint(15, 35)
+        update = {
+            "status": "ordered",
+            "items": line_items,
+            "swiggy_order_id": order_id,
+            "estimated_total": total,
+            "subtotal": subtotal,
+            "delivery_fee": delivery_fee,
+            "eta_minutes": eta,
+            "ordered_at": now_iso(),
+            "ordered_by": user["name"],
+            "mocked": True,
+            "updated_at": now_iso(),
+        }
+        content = (
+            f"{user['name']} placed a Swiggy Instamart order "
+            f"({len(line_items)} items, ₹{total}). "
+            f"ETA {eta} mins. Order ID {order_id}. [DEMO — connect Swiggy to place real orders]"
+        )
+
     await db.carts.update_one({"id": cart_id}, {"$set": update})
 
-    # System message announcing the order
     confirm_msg = {
         "id": str(uuid.uuid4()),
         "household_id": user["household_id"],
@@ -1287,7 +1468,7 @@ async def checkout_swiggy(cart_id: str, user=Depends(get_current_user)):
         "sender_name": "Jarvis",
         "sender_color": "#D97757",
         "role": "system",
-        "content": f"{user['name']} placed a Swiggy Instamart order ({len(line_items)} items, ₹{total}). ETA {eta} mins. Order ID {order_id}. [MOCKED]",
+        "content": content,
         "created_at": now_iso(),
     }
     await db.chat_messages.insert_one(confirm_msg)
@@ -1302,7 +1483,7 @@ async def checkout_swiggy(cart_id: str, user=Depends(get_current_user)):
 @api.post("/cart/from-chat")
 async def build_cart_from_chat(user=Depends(get_current_user)):
     """Force Jarvis to scan recent chat and propose a cart."""
-    if not EMERGENT_LLM_KEY:
+    if not ANTHROPIC_KEY and not _grok_client:
         raise HTTPException(500, "LLM not configured")
     msgs = await get_chat_context(user["household_id"], 30)
     chat_str = "\n".join([
@@ -1321,13 +1502,10 @@ Return JSON only:
 {{"extracted_items":[{{"name":"...","qty":"1 kg","note":"..."}}]}}
 """
     try:
-        llm = LlmChat(
-            api_key=EMERGENT_LLM_KEY,
-            session_id=f"cart-{user['household_id']}-{uuid.uuid4()}",
-            system_message="You extract Indian household grocery items from chat. JSON only.",
-        ).with_model(LLM_MODEL[0], LLM_MODEL[1])
-        raw = await llm.send_message(UserMessage(text=prompt))
-        text = raw if isinstance(raw, str) else str(raw)
+        text = await llm_call(
+            "You extract Indian household grocery items from chat. JSON only.",
+            prompt, max_tokens=1024,
+        )
         text = text.strip()
         if text.startswith("```"):
             text = text.split("```", 2)[1]
@@ -1348,7 +1526,7 @@ Return JSON only:
 # -------- AI bulk endpoints (unchanged) --------
 @api.post("/ai/generate-weekly-plan")
 async def generate_weekly_plan(user=Depends(get_current_user)):
-    if not EMERGENT_LLM_KEY:
+    if not ANTHROPIC_KEY and not _grok_client:
         raise HTTPException(500, "LLM key not configured")
     household_id = user["household_id"]
     days = week_dates()
@@ -1361,14 +1539,8 @@ Respect diets and allergies. Simple home-style meals.
 Return ONLY valid JSON:
 {{"days":[{{"date":"YYYY-MM-DD","breakfast":{{"name":"...","ingredients":["..."],"notes":"..."}},"lunch":{{"name":"...","ingredients":["..."],"notes":"..."}},"dinner":{{"name":"...","ingredients":["..."],"notes":"..."}}}}]}}
 """
-    llm = LlmChat(
-        api_key=EMERGENT_LLM_KEY,
-        session_id=f"plan-{household_id}-{uuid.uuid4()}",
-        system_message="You output strict JSON meal plans.",
-    ).with_model(LLM_MODEL[0], LLM_MODEL[1])
     try:
-        raw = await llm.send_message(UserMessage(text=prompt))
-        text = raw if isinstance(raw, str) else str(raw)
+        text = await llm_call("You output strict JSON meal plans.", prompt, max_tokens=4096)
         text = text.strip()
         if text.startswith("```"):
             text = text.split("```", 2)[1]
@@ -1403,7 +1575,7 @@ Return ONLY valid JSON:
 
 @api.post("/ai/cook-instructions")
 async def cook_instructions(user=Depends(get_current_user)):
-    if not EMERGENT_LLM_KEY:
+    if not ANTHROPIC_KEY and not _grok_client:
         raise HTTPException(500, "LLM not configured")
     household_id = user["household_id"]
     today = date.today().isoformat()
@@ -1431,14 +1603,12 @@ Pantry: {', '.join([p['name'] for p in pantry[:20]])}
 
 Sections: Breakfast/Lunch/Dinner. Each: ingredients (4 ppl quantities), 4-6 prep steps, notes. End with items to buy.
 """
-    llm = LlmChat(
-        api_key=EMERGENT_LLM_KEY,
-        session_id=f"cook-{household_id}-{uuid.uuid4()}",
-        system_message="Practical Indian household cook notes. Plain text only.",
-    ).with_model(LLM_MODEL[0], LLM_MODEL[1])
     try:
-        raw = await llm.send_message(UserMessage(text=prompt))
-        return {"date": today, "instructions": raw if isinstance(raw, str) else str(raw), "plan": plan}
+        instructions = await llm_call(
+            "Practical Indian household cook notes. Plain text only.",
+            prompt, max_tokens=2048,
+        )
+        return {"date": today, "instructions": instructions, "plan": plan}
     except Exception as e:
         raise HTTPException(500, f"LLM error: {e}")
 
