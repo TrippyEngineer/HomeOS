@@ -47,16 +47,10 @@ jobs:
 
       - name: Create .env
         working-directory: backend
-        env:
-          JWT_SECRET: ${{ secrets.JWT_SECRET }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
         run: |
           printf 'MONGO_URL=mongodb://localhost:27017\n' > .env
           printf 'DB_NAME=homeos_ci\n' >> .env
-          printf 'JWT_SECRET=%s\n' "$JWT_SECRET" >> .env
-          printf 'ANTHROPIC_API_KEY=%s\n' "$ANTHROPIC_API_KEY" >> .env
-          printf 'XAI_API_KEY=%s\n' "$XAI_API_KEY" >> .env
+          printf 'JWT_SECRET=ci-test-secret-homeos-pipeline\n' >> .env
           printf 'CORS_ORIGINS=*\n' >> .env
 
       - name: Start backend

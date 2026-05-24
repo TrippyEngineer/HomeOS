@@ -34,7 +34,7 @@ SWIGGY_OAUTH_TOKEN_URL = "https://www.swiggy.com/auth/oauth/token"
 
 SWIGGY_CLIENT_ID = os.environ.get("SWIGGY_CLIENT_ID", "")
 SWIGGY_CLIENT_SECRET = os.environ.get("SWIGGY_CLIENT_SECRET", "")
-SWIGGY_REDIRECT_URI = os.environ.get("SWIGGY_REDIRECT_URI", "http://localhost:8000/api/swiggy/callback")
+SWIGGY_REDIRECT_URI = os.environ.get("SWIGGY_REDIRECT_URI", "http://localhost/callback")
 
 DEFAULT_LAT = "28.533322"
 DEFAULT_LNG = "77.249151"
