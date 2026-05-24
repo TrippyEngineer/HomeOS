@@ -62,12 +62,21 @@ jobs:
       - name: Start backend
         working-directory: backend
         run: |
-          uvicorn server:app --port 8000 &
+          uvicorn server:app --port 8000 > /tmp/uvicorn.log 2>&1 &
           echo "Waiting for backend to be ready..."
-          for i in $(seq 1 15); do
-            curl -sf http://localhost:8000/api/ && echo "Backend ready." && break
-            sleep 2
+          for i in $(seq 1 20); do
+            if curl -sf http://localhost:8000/api/ > /dev/null; then
+              echo "Backend ready after $i attempts."
+              break
+            fi
+            echo "Attempt $i: not ready yet..."
+            sleep 3
           done
+          curl -sf http://localhost:8000/api/ > /dev/null || {
+            echo "=== Backend failed to start. uvicorn log: ==="
+            cat /tmp/uvicorn.log
+            exit 1
+          }
 
       - name: Run tests
         working-directory: backend
