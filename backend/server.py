@@ -30,8 +30,7 @@ from openai import AsyncOpenAI
 from fastapi.responses import RedirectResponse
 
 from broadcaster import broadcaster
-from orchestrator import orchestrator, AgentResult
-from swiggy_mcp import SwiggyMAPIClient, SwiggyMCPClient, build_auth_url, exchange_code_for_token
+from swiggy_mcp import SwiggyMAPIClient, build_auth_url, exchange_code_for_token
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -893,7 +892,6 @@ async def _process_instagram_link(household_id: str, user: dict, content: str) -
     return [strip_id(card)]
 
 
-
 async def _get_or_create_draft_cart(household_id: str):
     cart = await db.carts.find_one(
         {"household_id": household_id, "status": "draft"}, {"_id": 0}
@@ -1201,9 +1199,6 @@ async def recipe_from_text(payload: TextRecipeReq, user=Depends(get_current_user
     strip_id(card)
     await _broadcast_message(card)
     return {"recipe": recipe_doc, "message": card}
-
-
-
 
 @api.post("/cart/item")
 async def add_cart_item(payload: CartItem, user=Depends(get_current_user)):
